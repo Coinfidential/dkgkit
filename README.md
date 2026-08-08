@@ -4,16 +4,27 @@ Threshold cryptography for Bitcoin — FROST distributed key generation,
 resharing and signing; MuSig2 transaction-tree cosigning; BIP-352 silent
 payments. Rust core compiled to WebAssembly, with a TypeScript API over it.
 
-> **Status: DKG implemented; everything else is still a contract.** The three
-> DKG rounds below work and are covered by an end-to-end test. Signing,
-> resharing, BIP-352 and the MuSig2 tree paths are documented targets, not code
+> **Status: key generation and signing work; the rest is still a contract.**
+> Resharing, BIP-352 and the MuSig2 tree paths are documented targets, not code
 > — they still live in a private monorepo. Nothing is published to a registry.
 
 ## What exists today
 
-`dkg_round1` · `dkg_round2` · `dkg_finalize` — 192 lines of JSON marshalling
-over [`frost-secp256k1-tr`](https://crates.io/crates/frost-secp256k1-tr), the
-Zcash Foundation's RFC 9591 implementation in its BIP-340/341 taproot variant.
+| | |
+|---|---|
+| Key generation | `dkg_round1` · `dkg_round2` · `dkg_finalize` |
+| Signing | `sign_nonce` · `sign_share` · `sign_aggregate` |
+
+Thin JSON marshalling over
+[`frost-secp256k1-tr`](https://crates.io/crates/frost-secp256k1-tr), the Zcash
+Foundation's RFC 9591 implementation in its BIP-340/341 taproot variant.
+Signatures are aggregated with the taproot tweak applied, so they verify
+against the output key a Bitcoin node checks.
+
+**`sign_share` and `sign_aggregate` must be given the same merkle root.** The
+tweak is applied to each signer's key package, so a disagreement produces
+shares the aggregator rejects. Nothing in the types enforces this; a test
+does. Note `None` and `""` mean the same thing — the key-path-only tweak.
 
 This crate deliberately contains **no cryptography of its own**: no curve
 arithmetic, no polynomial evaluation, no challenge or binding-factor

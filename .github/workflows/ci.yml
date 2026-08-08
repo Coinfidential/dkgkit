@@ -1,0 +1,30 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # Must stay: a host test cannot catch a feature gap that only bites on
+      # wasm. `OsRng` sitting behind rand_core/getrandom was exactly that — a
+      # dev-dependency on `rand` supplied the feature during `cargo test`, so
+      # the whole suite passed while the wasm build was broken.
+      - run: cargo build --target wasm32-unknown-unknown --release
