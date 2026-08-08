@@ -1,68 +1,90 @@
 # dkgkit
 
-Threshold cryptography core — FROST distributed key generation, resharing and
-signing, MuSig2 transaction-tree cosigning, and BIP-352 silent payments.
+Threshold cryptography for Bitcoin — FROST distributed key generation,
+resharing and signing; MuSig2 transaction-tree cosigning; BIP-352 silent
+payments. Rust core compiled to WebAssembly, with a TypeScript API over it.
 
-> **Status: ready to extract.** The code currently lives in
-> [`coinfidential`](https://github.com/Coinfidential/coinfidential) at
-> `crates/dkgkit-wasm/` and `packages/crypto/`. This repo is the reserved home;
-> extraction is step 1 of the split.
+> **Status: reserved, extraction pending.** The implementation currently lives
+> in a private monorepo and moves here as a unit. This repo holds the boundary
+> contract until then. Nothing here is published to a registry yet.
 
-## What lands here
+## Design
 
-| Path in monorepo | LOC | Role |
-|---|---|---|
-| `crates/dkgkit-wasm/` | 2.6k | Rust FROST implementation, compiled to wasm |
-| `packages/crypto/` | 8.5k | TypeScript API over the wasm, plus BIP-352 and taproot primitives |
+**Transport-agnostic.** No networking, no message format, no opinion about how
+participants reach each other. FROST participants are identified by
+`participantId: number` — not by a public key from any particular identity
+system. Whatever carries the ceremony messages is somebody else's problem.
 
-**These two move together, always.** `packages/crypto/wasm/` is *generated* from
-the crate by `bun run build:wasm`. A change to the crate is a change to the
-package whether or not the diff shows it. Never split them, and never grant
-review ownership of one without the other.
+**Dual-runtime from one build.** `initFrost(wasmBytes?)` takes optional bytes:
+a browser omits them and lets the module fetch, a server runtime passes
+`readFileSync(path)`. One `wasm-pack --target web` build serves both, so the
+same code runs in a webview and under Node/Bun without a second target.
 
-## Why this unit is extractable first
+**The crate and the package are one unit.** The TypeScript package's `wasm/`
+directory is *generated* from the Rust crate. A change to the crate is a change
+to the package whether or not the diff shows it. They are versioned, reviewed
+and released together.
 
-- **Zero transport coupling** — `nostr-tools` appears in 0 files.
-- **Zero upward dependencies** — imports no other `@coinfidential/*` package.
-- **Transport-agnostic identity** — FROST participants are `participantId: number`,
-  not Nostr pubkeys. The pubkey→id mapping lives one layer up.
-- **Dual-runtime already** — `initFrost(wasmBytes?)` takes optional bytes: the
-  browser omits them and fetches, Bun passes `readFileSync(path)`. One
-  `--target web` build serves both.
+## API
 
-## Public API
+### Lifecycle
+`initFrost(wasmBytes?)` — must be awaited before any FROST call.
 
-Grouped by concern. Full symbol-by-symbol tables, with which consumer uses what,
-are in the monorepo at [`docs/architecture/01-crypto.md`](https://github.com/Coinfidential/coinfidential/blob/main/docs/architecture/01-crypto.md).
-
-- **Lifecycle** — `initFrost`
-- **FROST keygen** — `dkgRound1`, `dkgRound2`, `dkgFinalize`
-- **FROST reshare** — `reshareDeal`, `reshareFinalize`, `reshareGroupKey`, `verifyClaimedShares`
-- **FROST signing** — `signNonce`, `signShare`, `signAggregate`, `tweakGroupKey`, `outputTweak`
-- **MuSig2 tree** — `musigTreeNonce`, `musigTreePartial`, `aggregateTreeNonce`, `aggregateTreePartials`, `validateVtxoBranch`
-- **BIP-352** — `encodeSilentPaymentAddress`, `deriveArkSilentOutput`, `scanTxWithTweaks`, `scanArkTx`, `combineEcdh`
-- **DLEQ** — `dleqProve`, `dleqVerify`
-- **Tx / taproot** — `buildUnsignedTx`, `taprootSighashes`, `assembleKeyPathTx`, `p2trScriptHex`, `txidOf`
-- **Ark structures** — `encodeArkAddress`, `vtxoTaprootOutput`, `arkCheckpointTxid`, `assertCanonicalCheckpointUnroll`
-
-## Consumers
-
-| Repo | Symbols imported |
+### FROST
+| Area | Functions |
 |---|---|
-| [`rails`](https://github.com/Coinfidential/rails) | 15 |
-| [`steward`](https://github.com/Coinfidential/steward) | 38 |
-| [`desktop`](https://github.com/Coinfidential/desktop) | 58 |
+| Key generation | `dkgRound1`, `dkgRound2`, `dkgFinalize` |
+| Resharing | `reshareDeal`, `reshareFinalize`, `reshareGroupKey`, `verifyClaimedShares`, `shareScalar` |
+| Signing | `signNonce`, `signShare`, `signShareForOutput`, `signAggregate`, `signAggregateForOutput` |
+| Key tweaking | `tweakGroupKey`, `outputTweak` |
 
-## Extraction checklist
+Resharing performs a distributed Shamir redistribution under the *same* group
+key: the roster or threshold changes without a new DKG, no party ever holds
+`f(0)`, and derived addresses are untouched.
 
-- [ ] Move `crates/` + `packages/crypto/` with `git filter-repo` (preserves history)
-- [ ] Keep `build:wasm` here — it is the crate→package bridge
-- [ ] Publish the wasm artifact **with** the package; consumers must not need a Rust toolchain
-- [ ] Pin consumers to an exact version — a floating range on a signing library is a supply-chain hole
-- [ ] Unit tests come along; they need no regtest stack and already skip when the wasm is absent
+### MuSig2 — transaction-tree cosigning
+`musigTreeNonce`, `musigTreePartial`, `aggregateTreeNonce`,
+`aggregateTreePartials`, `treeCoefficients`, `treeLagrangeHex`,
+`treeAggregateOutputXonly`, `treeTxSighashes`, `validateFinalizedRoot`,
+`validateVtxoBranch`
+
+### BIP-352 — silent payments
+`encodeSilentPaymentAddress`, `decodeSilentPaymentAddress`,
+`encodeSilentArkAddress`, `decodeSilentArkAddress`, `deriveArkSilentOutput`,
+`scanTxWithTweaks`, `scanArkTx`, `combineEcdh`, `deriveFromCombinedEcdh`,
+`vaultAnchorEcdh`, `expectedP`
+
+Scanning and derivation work against a delegated scan secret, so a scanner can
+detect incoming payments without any spending authority.
+
+### DLEQ
+`dleqProve`, `dleqVerify` — used to prove a threshold ECDH share was computed
+from the same secret as the participant's committed public share.
+
+### Transaction & taproot primitives
+`buildUnsignedTx`, `parseTx`, `parsePsbtTx`, `assembleKeyPathTx`,
+`taprootSighashes`, `taprootScriptSighashes`, `tapLeafHash`, `p2trScriptHex`,
+`decodeP2TR`, `toXOnly`, `txidOf`, `vaultInputContext`
+
+### Ark structures
+`encodeArkAddress`, `decodeArkAddress`, `vtxoTaprootOutput`,
+`vtxoForfeitScriptHex`, `arkCheckpointOutput`, `arkCheckpointTxid`,
+`assertCanonicalCheckpointUnroll`, `recoverBatchExpiry`, `sweepTapRoot`
+
+## Dependencies
+
+`@noble/curves`, `@noble/hashes`, `@scure/base`, `@scure/btc-signer` — no
+network, no I/O, no framework.
 
 ## Security
 
-This repo is the audit surface for everything that touches key material. Treat
-every change as consensus-critical. Findings and their resolution status are
-tracked in the monorepo under `docs/security/`.
+**Pre-audit software handling real key material.** It has not been reviewed by
+an external auditor and is not recommended for production custody. Treat every
+change as consensus-critical.
+
+If you find a vulnerability, please report it privately rather than opening a
+public issue.
+
+## License
+
+MIT
