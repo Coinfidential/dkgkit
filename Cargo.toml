@@ -1,0 +1,40 @@
+[package]
+name = "dkgkit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Minimal FROST threshold key generation for Bitcoin, over an audited core"
+repository = "https://github.com/Coinfidential/dkgkit"
+rust-version = "1.76"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Five direct dependencies; exactly one of them is cryptography.
+#
+# frost-secp256k1-tr is the Zcash Foundation's RFC 9591 implementation in its
+# BIP-340/341 taproot variant, over RustCrypto's k256. We write no curve
+# arithmetic, no polynomial code and no binding-factor derivation — getting
+# those subtly wrong is precisely how threshold schemes leak shares.
+#
+# Note this is 56 transitive crates, MORE than the 47 of the implementation it
+# replaces. That is the intended trade: RustCrypto splits into many small,
+# individually reviewable crates, whereas the previous 47 concealed ~157KB of
+# bespoke unaudited FROST pinned by git revision to a personal repository.
+# Count the code you must trust, not the entries in Cargo.lock.
+[dependencies]
+frost-secp256k1-tr = { version = "3", default-features = false, features = ["serde"] }
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Declared explicitly for its `getrandom` feature: without it `OsRng` does not
+# exist, and the gap only shows on a wasm release build — a dev-dependency on
+# `rand` silently supplies the feature during `cargo test`.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# wasm has no OS entropy source; this routes getrandom at the browser crypto API.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[dev-dependencies]
+rand = "0.8"

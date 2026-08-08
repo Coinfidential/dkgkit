@@ -4,9 +4,26 @@ Threshold cryptography for Bitcoin — FROST distributed key generation,
 resharing and signing; MuSig2 transaction-tree cosigning; BIP-352 silent
 payments. Rust core compiled to WebAssembly, with a TypeScript API over it.
 
-> **Status: reserved, extraction pending.** The implementation currently lives
-> in a private monorepo and moves here as a unit. This repo holds the boundary
-> contract until then. Nothing here is published to a registry yet.
+> **Status: DKG implemented; everything else is still a contract.** The three
+> DKG rounds below work and are covered by an end-to-end test. Signing,
+> resharing, BIP-352 and the MuSig2 tree paths are documented targets, not code
+> — they still live in a private monorepo. Nothing is published to a registry.
+
+## What exists today
+
+`dkg_round1` · `dkg_round2` · `dkg_finalize` — 192 lines of JSON marshalling
+over [`frost-secp256k1-tr`](https://crates.io/crates/frost-secp256k1-tr), the
+Zcash Foundation's RFC 9591 implementation in its BIP-340/341 taproot variant.
+
+This crate deliberately contains **no cryptography of its own**: no curve
+arithmetic, no polynomial evaluation, no challenge or binding-factor
+derivation. Those are delegated wholesale, because subtly wrong versions of
+them are how threshold schemes leak shares.
+
+```
+cargo test                                  # 2-of-3 DKG, end to end
+cargo build --target wasm32-unknown-unknown --release
+```
 
 ## Design
 
