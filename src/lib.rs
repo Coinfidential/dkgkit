@@ -45,34 +45,24 @@ pub struct Finalized {
 }
 
 // ── Entropy ─────────────────────────────────────────────────────────────────
-//
-// Coldcard's 2026 incident is the design brief here: a March 2021 firmware
-// error silently routed seed generation away from the STM32 hardware RNG to a
-// software PRNG, collapsing effective entropy from 128 bits to roughly 40. It
-// went unnoticed for five years and cost ~1,367 BTC across 4,585 addresses.
-//
-// The device had a hardware TRNG. The failure was silent substitution, not a
-// wrong algorithm — so the defences that matter are: never trust one source,
-// and never fail quietly.
 
 /// Build the RNG for one operation from the OS source, optionally strengthened
 /// with caller-supplied physical entropy (dice, a hardware RNG, a second
 /// device).
 ///
 /// `seed = SHA-512(os_entropy ‖ extra)[..32]`, and **the OS draw is always
-/// included**. That ordering is the whole safety argument: supplying bad extra
-/// entropy cannot weaken the result, while good extra entropy rescues a
-/// compromised OS source. A caller-supplied seed that *replaced* the OS draw
-/// would trade one single point of failure for another.
+/// included** — bad extra entropy cannot weaken the result, good extra entropy
+/// rescues a compromised OS source. See the README for why replacing the OS
+/// draw rather than adding to it would be worse.
 fn rng(extra: Option<String>) -> Result<ChaCha20Rng, String> {
     let mut os = [0u8; 32];
     OsRng
         .try_fill_bytes(&mut os)
         .map_err(|e| format!("OS entropy unavailable: {e}"))?;
 
-    // A degenerate draw is the one failure that must never pass silently. This
-    // catches a stubbed or misrouted source — exactly the Coldcard shape —
-    // not statistical bias, which no cheap check can detect.
+    // Catches a stubbed or misrouted source, not statistical bias — no cheap
+    // check detects that. The point is that it fails loudly rather than
+    // quietly producing keys.
     if os == [0u8; 32] || os.iter().all(|&b| b == os[0]) {
         return Err("OS entropy returned a constant — refusing to generate keys".into());
     }
@@ -91,20 +81,20 @@ fn ident(n: u16) -> Result<Identifier, String> {
     Identifier::try_from(n).map_err(|e| format!("bad participant id {n}: {e}"))
 }
 
-fn keyed<T>(m: BTreeMap<Identifier, T>, ids: &[u16]) -> Result<Packages<T>, String> {
-    // frost keys by Identifier; the JS side keys by the participant number it
-    // already uses everywhere else. Rebuild the mapping rather than exposing
-    // Identifier's serialization, which is an implementation detail.
-    let mut out = BTreeMap::new();
-    for (k, v) in m {
-        let n = ids
-            .iter()
-            .copied()
-            .find(|n| ident(*n).map(|i| i == k).unwrap_or(false))
-            .ok_or_else(|| "frost returned an unknown participant".to_string())?;
-        out.insert(n, v);
+/// Inverse of [`ident`]. An `Identifier` is the participant number as a
+/// big-endian scalar, so the number is the low two bytes and everything above
+/// them must be zero.
+fn unident(id: &Identifier) -> Result<u16, String> {
+    let b = id.serialize();
+    let (high, low) = b.split_at(b.len() - 2);
+    if high.iter().any(|&x| x != 0) {
+        return Err("participant id outside u16".into());
     }
-    Ok(out)
+    Ok(u16::from_be_bytes([low[0], low[1]]))
+}
+
+fn keyed<T>(m: BTreeMap<Identifier, T>) -> Result<Packages<T>, String> {
+    m.into_iter().map(|(k, v)| Ok((unident(&k)?, v))).collect()
 }
 
 fn unkeyed<T>(m: Packages<T>) -> Result<BTreeMap<Identifier, T>, String> {
@@ -142,13 +132,11 @@ pub fn dkg_round2(secret: &str, round1: &str) -> Result<String, String> {
     let secret: frost::keys::dkg::round1::SecretPackage = from_json(secret, "round1 secret")?;
     let received: Packages<frost::keys::dkg::round1::Package> =
         from_json(round1, "round1 packages")?;
-    let ids: Vec<u16> = received.keys().copied().collect();
-
     let (secret, packages) = frost::keys::dkg::part2(secret, &unkeyed(received)?)
         .map_err(|e| format!("dkg round2: {e}"))?;
     to_json(&Round2 {
         secret,
-        packages: keyed(packages, &ids)?,
+        packages: keyed(packages)?,
     })
 }
 
@@ -294,31 +282,10 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The safety property of the mixing rule: caller-supplied entropy is
-    /// folded in ON TOP of the OS draw, never instead of it. Passing the same
-    /// `extra` twice must still produce different keys — otherwise a caller
-    /// with a fixed "physical" seed would silently make every vault identical.
-    #[test]
-    fn caller_entropy_cannot_make_output_deterministic() {
-        let fixed = Some("de".repeat(32));
-        let a = dkg_round1(1, 2, 3, fixed.clone()).unwrap();
-        let b = dkg_round1(1, 2, 3, fixed).unwrap();
-        assert_ne!(a, b, "OS entropy must always be mixed in");
-    }
+    const MSG: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
-    /// And the converse: the extra entropy has to actually reach the RNG.
-    /// A parameter that is accepted and ignored would look identical from
-    /// outside — which is the shape of the Coldcard failure.
-    #[test]
-    fn caller_entropy_reaches_the_rng() {
-        // Same OS draw is impossible to force, so assert on the seed path
-        // directly: two RNGs differing only in `extra` must diverge.
-        let mut x = rng(Some("00".into())).unwrap();
-        let mut y = rng(Some("01".into())).unwrap();
-        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
-        x.fill_bytes(&mut a);
-        y.fill_bytes(&mut b);
-        assert_ne!(a, b);
+    fn kp(k: &Finalized) -> String {
+        serde_json::to_string(&k.key_package).unwrap()
     }
 
     /// Runs a full DKG through the same JSON boundary the wasm callers use and
@@ -383,6 +350,40 @@ mod tests {
             .collect()
     }
 
+    /// Signing round 1 for a set of signers. Returns their nonces alongside the
+    /// commitments JSON, which signers and aggregator must both use verbatim.
+    fn commit(signers: &[(u16, &Finalized)]) -> (Vec<SignNonce>, String) {
+        let nonces: Vec<SignNonce> = signers
+            .iter()
+            .map(|(_, k)| serde_json::from_str(&sign_nonce(&kp(k), None).unwrap()).unwrap())
+            .collect();
+        let commitments: Packages<_> = signers
+            .iter()
+            .zip(&nonces)
+            .map(|((id, _), n)| (*id, n.commitments))
+            .collect();
+        (nonces, serde_json::to_string(&commitments).unwrap())
+    }
+
+    /// Signing round 2 for every signer, under one merkle root.
+    fn shares(
+        signers: &[(u16, &Finalized)],
+        nonces: &[SignNonce],
+        commitments: &str,
+        root: Option<String>,
+    ) -> String {
+        let m: Packages<frost::round2::SignatureShare> = signers
+            .iter()
+            .zip(nonces)
+            .map(|((id, k), n)| {
+                let n = serde_json::to_string(&n.nonces).unwrap();
+                let s = sign_share(&kp(k), &n, commitments, MSG, root.clone()).unwrap();
+                (*id, serde_json::from_str(&s).unwrap())
+            })
+            .collect();
+        serde_json::to_string(&m).unwrap()
+    }
+
     #[test]
     fn dkg_2_of_3_agrees_on_one_group_key() {
         let keys = run_dkg(&[1, 2, 3], 2);
@@ -392,50 +393,58 @@ mod tests {
         assert_eq!(keys[0].group_key.len(), 66, "33-byte compressed point");
     }
 
-    /// The assertion that actually matters: two of three sign, and the
-    /// aggregate verifies against the BIP-341-tweaked output key. A signature
-    /// that aggregates but does not verify is the failure mode worth catching.
+    /// Pins the assumption `unident` makes about upstream's scalar encoding.
+    /// If frost ever changes it, round-2 packages would be misaddressed.
+    #[test]
+    fn participant_ids_round_trip() {
+        for n in [1u16, 2, 255, 256, u16::MAX] {
+            assert_eq!(unident(&ident(n).unwrap()).unwrap(), n);
+        }
+    }
+
+    /// The safety property of the mixing rule: caller entropy is folded in ON
+    /// TOP of the OS draw, never instead of it. The same `extra` twice must
+    /// still produce different keys — otherwise a caller with a fixed
+    /// "physical" seed would silently make every vault identical.
+    #[test]
+    fn caller_entropy_cannot_make_output_deterministic() {
+        let fixed = Some("de".repeat(32));
+        let a = dkg_round1(1, 2, 3, fixed.clone()).unwrap();
+        let b = dkg_round1(1, 2, 3, fixed).unwrap();
+        assert_ne!(a, b, "OS entropy must always be mixed in");
+    }
+
+    /// And the converse: a parameter accepted and ignored looks identical from
+    /// outside, which is exactly how entropy bugs survive for years.
+    #[test]
+    fn caller_entropy_reaches_the_rng() {
+        let mut x = rng(Some("00".into())).unwrap();
+        let mut y = rng(Some("01".into())).unwrap();
+        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+        x.fill_bytes(&mut a);
+        y.fill_bytes(&mut b);
+        assert_ne!(a, b);
+    }
+
+    /// The assertion that matters: two of three sign, and the aggregate
+    /// verifies against the BIP-341-tweaked output key. A signature that
+    /// aggregates but does not verify is the failure worth catching.
     #[test]
     fn two_of_three_produces_a_verifying_signature() {
         use frost::keys::Tweak;
 
         let keys = run_dkg(&[1, 2, 3], 2);
-        let msg = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let signers = [(1u16, &keys[0]), (2u16, &keys[1])];
-        let kp = |k: &Finalized| serde_json::to_string(&k.key_package).unwrap();
         // Empty merkle root = BIP-341 key-path-only spend. Both sides use it.
-        let root = || Some(String::new());
+        let root = Some(String::new());
 
-        // Round 1 — each signer commits to a single-use nonce.
-        let nonces: Vec<SignNonce> = signers
-            .iter()
-            .map(|(_, k)| serde_json::from_str(&sign_nonce(&kp(k), None).unwrap()).unwrap())
-            .collect();
-
-        let commitments: Packages<_> = signers
-            .iter()
-            .zip(&nonces)
-            .map(|((id, _), n)| (*id, n.commitments))
-            .collect();
-        let commitments = serde_json::to_string(&commitments).unwrap();
-
-        // Round 2 — each signer produces its share over the same package.
-        let shares: Packages<frost::round2::SignatureShare> = signers
-            .iter()
-            .zip(&nonces)
-            .map(|((id, k), n)| {
-                let nonces = serde_json::to_string(&n.nonces).unwrap();
-                let s = sign_share(&kp(k), &nonces, &commitments, msg, root()).unwrap();
-                (*id, serde_json::from_str(&s).unwrap())
-            })
-            .collect();
-
+        let (nonces, commitments) = commit(&signers);
         let sig = sign_aggregate(
             &commitments,
-            &serde_json::to_string(&shares).unwrap(),
+            &shares(&signers, &nonces, &commitments, root.clone()),
             &serde_json::to_string(&keys[0].public_key_package).unwrap(),
-            msg,
-            root(),
+            MSG,
+            root,
         )
         .unwrap();
 
@@ -446,62 +455,29 @@ mod tests {
         tweaked
             .verifying_key()
             .verify(
-                &unhex(msg).unwrap(),
+                &unhex(MSG).unwrap(),
                 &frost::Signature::deserialize(&unhex(&sig).unwrap()).unwrap(),
             )
             .expect("aggregate must verify against the tweaked output key");
     }
 
-    /// Locks down the footgun found while writing the test above: signer and
-    /// aggregator must commit to the same script tree. Nothing in the types
-    /// enforces it, and the failure surfaces only at aggregation.
+    /// Signer and aggregator must commit to the same script tree. Nothing in
+    /// the types enforces it and the failure surfaces only at aggregation.
     ///
-    /// Note `None` and `Some("")` are NOT a mismatch — upstream hashes an
-    /// empty root as a no-op, so both mean the key-path-only tweak. This test
-    /// therefore uses a genuinely different root.
+    /// Note `None` and `Some("")` are NOT a mismatch — upstream hashes an empty
+    /// root as a no-op, so both mean the key-path-only tweak. Hence a genuinely
+    /// different root here.
     #[test]
     fn tweak_must_match_on_both_sides() {
         let keys = run_dkg(&[1, 2, 3], 2);
-        let msg = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
         let signers = [(1u16, &keys[0]), (2u16, &keys[1])];
-        let kp = |k: &Finalized| serde_json::to_string(&k.key_package).unwrap();
 
-        let nonces: Vec<SignNonce> = signers
-            .iter()
-            .map(|(_, k)| serde_json::from_str(&sign_nonce(&kp(k), None).unwrap()).unwrap())
-            .collect();
-        let commitments: Packages<_> = signers
-            .iter()
-            .zip(&nonces)
-            .map(|((id, _), n)| (*id, n.commitments))
-            .collect();
-        let commitments = serde_json::to_string(&commitments).unwrap();
-
-        // Signers commit to a script tree…
-        let signer_root = "ff".repeat(32);
-        let shares: Packages<frost::round2::SignatureShare> = signers
-            .iter()
-            .zip(&nonces)
-            .map(|((id, k), n)| {
-                let nonces = serde_json::to_string(&n.nonces).unwrap();
-                let s = sign_share(
-                    &kp(k),
-                    &nonces,
-                    &commitments,
-                    msg,
-                    Some(signer_root.clone()),
-                )
-                .unwrap();
-                (*id, serde_json::from_str(&s).unwrap())
-            })
-            .collect();
-
-        // …while the aggregator assumes a key-path-only spend.
+        let (nonces, commitments) = commit(&signers);
         let err = sign_aggregate(
             &commitments,
-            &serde_json::to_string(&shares).unwrap(),
+            &shares(&signers, &nonces, &commitments, Some("ff".repeat(32))),
             &serde_json::to_string(&keys[0].public_key_package).unwrap(),
-            msg,
+            MSG,
             Some(String::new()),
         )
         .expect_err("mismatched merkle root must not produce a signature");
