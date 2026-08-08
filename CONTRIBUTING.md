@@ -16,6 +16,12 @@ chore: bump frost-secp256k1-tr
 Anything altering a public signature carries a `BREAKING CHANGE:` footer, so
 the crate's version bump can be derived rather than remembered.
 
+**The PR title must follow the same rule.** Squash merges take their subject
+from the PR title, not from the branch's commits, so a carefully written
+`feat:` commit otherwise lands on `main` under whatever the PR was called —
+which is exactly how #3 got a prose subject. CI checks the title; the
+individual commit messages survive in the squash body.
+
 The body is where the value is. Say why, and say what a reviewer would
 otherwise have to rediscover — a rejected alternative, a bug the change fixes,
 an upstream assumption now being relied on.

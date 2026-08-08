@@ -1,0 +1,33 @@
+name: pr-title
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+# Squash merges take their subject from the PR title, not from the branch's
+# commits — so a carefully written `feat:` commit still lands on main under
+# whatever the PR happens to be called. That already happened once here (#3).
+# This checks the title itself; the commit bodies survive via the repo's
+# squash_merge_commit_message=COMMIT_MESSAGES setting.
+jobs:
+  conventional:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          types='feat|fix|docs|refactor|test|chore|perf|build|ci|style|revert'
+          if ! grep -qE "^($types)(\([a-z0-9,._-]+\))?!?: .+" <<<"$TITLE"; then
+            echo "::error::PR title is not a Conventional Commit: $TITLE"
+            echo "Expected: <type>[(scope)][!]: <subject>   types: $types"
+            exit 1
+          fi
+          # A trailing period reads oddly once it becomes a commit subject.
+          if [[ "$TITLE" == *. ]]; then
+            echo "::error::drop the trailing period: $TITLE"
+            exit 1
+          fi
+          echo "ok: $TITLE"
