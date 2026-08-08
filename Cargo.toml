@@ -27,10 +27,16 @@ frost-secp256k1-tr = { version = "3", default-features = false, features = ["ser
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+hex = "0.4"
 # Declared explicitly for its `getrandom` feature: without it `OsRng` does not
 # exist, and the gap only shows on a wasm release build — a dev-dependency on
 # `rand` silently supplies the feature during `cargo test`.
+# Pinned to the majors frost-secp256k1-tr 3.0 itself uses. rand_core 0.9 and
+# rand_chacha 0.9 compile but their RngCore/CryptoRng are *different types*, so
+# the ChaCha RNG below would not satisfy frost's bounds.
 rand_core = { version = "0.6", features = ["getrandom"] }
+rand_chacha = "0.3"
+sha2 = "0.10"
 
 # wasm has no OS entropy source; this routes getrandom at the browser crypto API.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

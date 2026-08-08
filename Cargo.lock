@@ -115,10 +115,13 @@ version = "0.1.0"
 dependencies = [
  "frost-secp256k1-tr",
  "getrandom",
+ "hex",
  "rand",
+ "rand_chacha",
  "rand_core",
  "serde",
  "serde_json",
+ "sha2",
  "wasm-bindgen",
 ]
 
