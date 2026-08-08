@@ -344,11 +344,37 @@ pub fn sign_aggregate(
         &pubkeys,
         root.as_deref(),
     )
-    .map_err(|e| format!("aggregate: {e}"))?;
+    .map_err(aggregate_error)?;
 
     Ok(hex::encode(
         sig.serialize().map_err(|e| format!("signature: {e}"))?,
     ))
+}
+
+/// Turn an aggregation failure into something a caller can act on.
+///
+/// RFC 9591 calls this an *identifiable abort*: aggregation verifies every
+/// share, so when one does not check out the protocol knows exactly whose it
+/// was. Collapsing that to a message throws away the only fact that makes the
+/// failure actionable — a griefer who submits a bad share every round is
+/// indistinguishable from a flaky network unless you can name them.
+///
+/// The message stays human-readable and gains a machine-readable tail:
+/// `aggregate: <reason> [culprits: 2,3]`. Participants are `u16` here, as
+/// everywhere else in this crate, so the caller needs no `Identifier` type.
+fn aggregate_error(e: frost::Error) -> String {
+    let culprits: Vec<String> = e
+        .culprits()
+        .iter()
+        .filter_map(|id| unident(id).ok())
+        .map(|n| n.to_string())
+        .collect();
+
+    if culprits.is_empty() {
+        format!("aggregate: {e}")
+    } else {
+        format!("aggregate: {e} [culprits: {}]", culprits.join(","))
+    }
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
@@ -641,6 +667,41 @@ mod tests {
         )
         .expect_err("mismatched merkle root must not produce a signature");
         assert!(err.contains("Invalid signature share"), "got: {err}");
+    }
+
+    /// An identifiable abort, per RFC 9591: aggregation verifies every share,
+    /// so a failure knows exactly whose share was bad. Reporting only that
+    /// "aggregation failed" discards the one fact that makes it actionable — a
+    /// participant who submits a bad share every round is indistinguishable
+    /// from a flaky network unless you can name them.
+    #[test]
+    fn a_bad_share_is_attributed_to_its_signer() {
+        let keys = run_dkg(&[1, 2, 3], 2);
+        let signers = [(1u16, &keys[0]), (2u16, &keys[1])];
+        let root = Some(String::new());
+
+        let (nonces, commitments) = commit(&signers);
+        let good = shares(&signers, &nonces, &commitments, root.clone());
+
+        // Participant 2 submits participant 1's share as its own: structurally
+        // valid, cryptographically wrong, and attributable.
+        let mut map: Packages<frost::round2::SignatureShare> = serde_json::from_str(&good).unwrap();
+        let first = *map.get(&1).unwrap();
+        map.insert(2, first);
+
+        let err = sign_aggregate(
+            &commitments,
+            &serde_json::to_string(&map).unwrap(),
+            &serde_json::to_string(&keys[0].public_key_package).unwrap(),
+            MSG,
+            root,
+        )
+        .expect_err("a forged share must not aggregate");
+
+        assert!(
+            err.contains("culprits: 2"),
+            "must name participant 2, got: {err}"
+        );
     }
 
     /// The invariant that makes resharing useful: shares are redistributed on
