@@ -685,8 +685,7 @@ mod tests {
 
         // Participant 2 submits participant 1's share as its own: structurally
         // valid, cryptographically wrong, and attributable.
-        let mut map: Packages<frost::round2::SignatureShare> =
-            serde_json::from_str(&good).unwrap();
+        let mut map: Packages<frost::round2::SignatureShare> = serde_json::from_str(&good).unwrap();
         let first = *map.get(&1).unwrap();
         map.insert(2, first);
 
@@ -699,7 +698,10 @@ mod tests {
         )
         .expect_err("a forged share must not aggregate");
 
-        assert!(err.contains("culprits: 2"), "must name participant 2, got: {err}");
+        assert!(
+            err.contains("culprits: 2"),
+            "must name participant 2, got: {err}"
+        );
     }
 
     /// The invariant that makes resharing useful: shares are redistributed on
