@@ -4,9 +4,9 @@ Threshold cryptography for Bitcoin — FROST distributed key generation,
 resharing and signing; MuSig2 transaction-tree cosigning; BIP-352 silent
 payments. Rust core compiled to WebAssembly, with a TypeScript API over it.
 
-> **Status: key generation and signing work; the rest is still a contract.**
-> Resharing, BIP-352 and the MuSig2 tree paths are documented targets, not code
-> — they still live in a private monorepo. Nothing is published to a registry.
+> **Status: key generation, signing and resharing work.** BIP-352 and the
+> MuSig2 tree paths are documented targets, not code. Nothing is published to a
+> registry.
 
 ## What exists today
 
@@ -14,6 +14,7 @@ payments. Rust core compiled to WebAssembly, with a TypeScript API over it.
 |---|---|
 | Key generation | `dkg_round1` · `dkg_round2` · `dkg_finalize` |
 | Signing | `sign_nonce` · `sign_share` · `sign_aggregate` |
+| Resharing | `reshare_round1` · `reshare_round2` · `reshare_finalize` |
 
 Thin JSON marshalling over
 [`frost-secp256k1-tr`](https://crates.io/crates/frost-secp256k1-tr), the Zcash
@@ -25,6 +26,24 @@ against the output key a Bitcoin node checks.
 tweak is applied to each signer's key package, so a disagreement produces
 shares the aggregator rejects. Nothing in the types enforces this; a test
 does. Note `None` and `""` mean the same thing — the key-path-only tweak.
+
+## Resharing
+
+Redistributes shares on fresh polynomials while the group key — and therefore
+the address and its UTXOs — stays put. Distributed: no party ever reconstructs
+the secret.
+
+Two limits, both verified by tests rather than read off documentation:
+
+| | |
+|---|---|
+| Refresh shares in place | yes |
+| **Remove** a member | yes |
+| **Add** a member | **no** — finalisation needs the caller's own previous key package, which a new member does not have |
+| Change the threshold | **no** — upstream compares `min_signers` against the old key package and refuses |
+
+So a t-of-n vault stays t-of-n for life. Changing `t`, or admitting someone who
+has never held a share, means a fresh DKG — a new group key and a new address.
 
 ## Entropy
 
@@ -81,51 +100,22 @@ directory is *generated* from the Rust crate. A change to the crate is a change
 to the package whether or not the diff shows it. They are versioned, reviewed
 and released together.
 
-## API
+## Still to port
 
-### Lifecycle
-`initFrost(wasmBytes?)` — must be awaited before any FROST call.
+Everything below still lives in the private monorepo as TypeScript. Listed so
+the remaining surface is visible, not as a claim that it exists here.
 
-### FROST
-| Area | Functions |
+| Area | What it covers |
 |---|---|
-| Key generation | `dkgRound1`, `dkgRound2`, `dkgFinalize` |
-| Resharing | `reshareDeal`, `reshareFinalize`, `reshareGroupKey`, `verifyClaimedShares`, `shareScalar` |
-| Signing | `signNonce`, `signShare`, `signShareForOutput`, `signAggregate`, `signAggregateForOutput` |
-| Key tweaking | `tweakGroupKey`, `outputTweak` |
+| BIP-352 silent payments | address encode/decode, output derivation, scanning against tweak data |
+| MuSig2 transaction tree | Ark cosigning: nonces, partials, branch validation |
+| DLEQ | proving a threshold ECDH share came from the committed secret |
+| Transaction & taproot | sighashes, key-path assembly, script helpers |
+| Ark structures | VTXO outputs, checkpoints, batch expiry |
 
-Resharing performs a distributed Shamir redistribution under the *same* group
-key: the roster or threshold changes without a new DKG, no party ever holds
-`f(0)`, and derived addresses are untouched.
-
-### MuSig2 — transaction-tree cosigning
-`musigTreeNonce`, `musigTreePartial`, `aggregateTreeNonce`,
-`aggregateTreePartials`, `treeCoefficients`, `treeLagrangeHex`,
-`treeAggregateOutputXonly`, `treeTxSighashes`, `validateFinalizedRoot`,
-`validateVtxoBranch`
-
-### BIP-352 — silent payments
-`encodeSilentPaymentAddress`, `decodeSilentPaymentAddress`,
-`encodeSilentArkAddress`, `decodeSilentArkAddress`, `deriveArkSilentOutput`,
-`scanTxWithTweaks`, `scanArkTx`, `combineEcdh`, `deriveFromCombinedEcdh`,
-`vaultAnchorEcdh`, `expectedP`
-
-Scanning and derivation work against a delegated scan secret, so a scanner can
-detect incoming payments without any spending authority.
-
-### DLEQ
-`dleqProve`, `dleqVerify` — used to prove a threshold ECDH share was computed
-from the same secret as the participant's committed public share.
-
-### Transaction & taproot primitives
-`buildUnsignedTx`, `parseTx`, `parsePsbtTx`, `assembleKeyPathTx`,
-`taprootSighashes`, `taprootScriptSighashes`, `tapLeafHash`, `p2trScriptHex`,
-`decodeP2TR`, `toXOnly`, `txidOf`, `vaultInputContext`
-
-### Ark structures
-`encodeArkAddress`, `decodeArkAddress`, `vtxoTaprootOutput`,
-`vtxoForfeitScriptHex`, `arkCheckpointOutput`, `arkCheckpointTxid`,
-`assertCanonicalCheckpointUnroll`, `recoverBatchExpiry`, `sweepTapRoot`
+Most of it is pure TypeScript over `@noble` and `@scure` with no browser
+dependency, so it may not need to become Rust at all — only FROST did, and only
+because the implementation it delegates to is a Rust crate.
 
 ## Dependencies
 

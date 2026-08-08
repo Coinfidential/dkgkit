@@ -166,6 +166,91 @@ pub fn dkg_finalize(secret: &str, round1: &str, round2: &str) -> Result<String, 
     })
 }
 
+// ── Resharing ───────────────────────────────────────────────────────────────
+
+// Rounds 1 and 2 reuse `Round1`/`Round2`: upstream models resharing as a DKG
+// over a zero-valued secret, so the packages are the same types. Only
+// finalisation differs, because it folds the result into the existing key.
+
+/// Reshare round 1. `total` is the size of the NEW roster; `threshold` must
+/// stay what it is today — see [`reshare_finalize`].
+#[wasm_bindgen]
+pub fn reshare_round1(
+    participant: u16,
+    threshold: u16,
+    total: u16,
+    extra_entropy: Option<String>,
+) -> Result<String, String> {
+    let (secret, package) = frost::keys::refresh::refresh_dkg_part1(
+        ident(participant)?,
+        total,
+        threshold,
+        rng(extra_entropy)?,
+    )
+    .map_err(|e| format!("reshare round1: {e}"))?;
+    to_json(&Round1 { secret, package })
+}
+
+/// Reshare round 2. Same shape as [`dkg_round2`]: `round1` must hold every
+/// other participant's package and not this participant's own.
+#[wasm_bindgen]
+pub fn reshare_round2(secret: &str, round1: &str) -> Result<String, String> {
+    let secret: frost::keys::dkg::round1::SecretPackage = from_json(secret, "round1 secret")?;
+    let received: Packages<frost::keys::dkg::round1::Package> =
+        from_json(round1, "round1 packages")?;
+    let (secret, packages) = frost::keys::refresh::refresh_dkg_part2(secret, &unkeyed(received)?)
+        .map_err(|e| format!("reshare round2: {e}"))?;
+    to_json(&Round2 {
+        secret,
+        packages: keyed(packages)?,
+    })
+}
+
+/// Reshare round 3: fold the refreshing shares into the existing key.
+///
+/// The group key and therefore the vault address are unchanged — that is the
+/// point. What changes is who holds a share.
+///
+/// **The threshold cannot change.** Upstream rejects a differing `min_signers`
+/// outright, so a t-of-n vault stays t-of-n across a reshare; only the roster
+/// and its size move. Changing `t` needs a fresh DKG and a new address.
+#[wasm_bindgen]
+pub fn reshare_finalize(
+    secret: &str,
+    round1: &str,
+    round2: &str,
+    old_key_package: &str,
+    old_public_key_package: &str,
+) -> Result<String, String> {
+    let secret: frost::keys::dkg::round2::SecretPackage = from_json(secret, "round2 secret")?;
+    let r1: Packages<frost::keys::dkg::round1::Package> = from_json(round1, "round1 packages")?;
+    let r2: Packages<frost::keys::dkg::round2::Package> = from_json(round2, "round2 packages")?;
+    let old_kp: frost::keys::KeyPackage = from_json(old_key_package, "old key package")?;
+    let old_pkp: frost::keys::PublicKeyPackage =
+        from_json(old_public_key_package, "old public keys")?;
+
+    let (key_package, public_key_package) = frost::keys::refresh::refresh_dkg_shares(
+        &secret,
+        &unkeyed(r1)?,
+        &unkeyed(r2)?,
+        old_pkp,
+        old_kp,
+    )
+    .map_err(|e| format!("reshare finalize: {e}"))?;
+
+    let group_key = hex::encode(
+        public_key_package
+            .verifying_key()
+            .serialize()
+            .map_err(|e| format!("group key: {e}"))?,
+    );
+    to_json(&Finalized {
+        key_package,
+        public_key_package,
+        group_key,
+    })
+}
+
 // ── Signing ─────────────────────────────────────────────────────────────────
 
 /// Signing round 1 output. `nonces` never leaves the participant and is
@@ -376,6 +461,78 @@ mod tests {
         serde_json::to_string(&m).unwrap()
     }
 
+    /// Reshare rounds 1 and 2 for `ids`. Split out from `run_reshare` so a test
+    /// can drive finalisation with deliberately mismatched inputs.
+    fn reshare_rounds(ids: &[u16], threshold: u16) -> (Vec<Round1>, Vec<Round2>) {
+        let total = ids.len() as u16;
+        let r1: Vec<Round1> = ids
+            .iter()
+            .map(|&i| {
+                serde_json::from_str(&reshare_round1(i, threshold, total, None).unwrap()).unwrap()
+            })
+            .collect();
+
+        let r2 = (0..ids.len())
+            .map(|k| {
+                let others = others_round1(ids, &r1, k);
+                let secret = serde_json::to_string(&r1[k].secret).unwrap();
+                serde_json::from_str(
+                    &reshare_round2(&secret, &serde_json::to_string(&others).unwrap()).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+        (r1, r2)
+    }
+
+    /// Every round-1 package except participant `k`'s own.
+    fn others_round1(
+        ids: &[u16],
+        r1: &[Round1],
+        k: usize,
+    ) -> Packages<frost::keys::dkg::round1::Package> {
+        ids.iter()
+            .enumerate()
+            .filter(|(j, _)| *j != k)
+            .map(|(j, &id)| (id, r1[j].package.clone()))
+            .collect()
+    }
+
+    /// The round-2 packages addressed to participant `me`.
+    fn round2_for(
+        ids: &[u16],
+        r2: &[Round2],
+        k: usize,
+        me: u16,
+    ) -> Packages<frost::keys::dkg::round2::Package> {
+        ids.iter()
+            .enumerate()
+            .filter(|(j, _)| *j != k)
+            .map(|(j, &id)| (id, r2[j].packages[&me].clone()))
+            .collect()
+    }
+
+    /// One reshare round over `ids`, returning each participant's new keys.
+    fn run_reshare(ids: &[u16], threshold: u16, old: &[Finalized]) -> Vec<Finalized> {
+        let (r1, r2) = reshare_rounds(ids, threshold);
+        ids.iter()
+            .enumerate()
+            .map(|(k, &me)| {
+                serde_json::from_str(
+                    &reshare_finalize(
+                        &serde_json::to_string(&r2[k].secret).unwrap(),
+                        &serde_json::to_string(&others_round1(ids, &r1, k)).unwrap(),
+                        &serde_json::to_string(&round2_for(ids, &r2, k, me)).unwrap(),
+                        &kp(&old[k]),
+                        &serde_json::to_string(&old[k].public_key_package).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
     #[test]
     fn dkg_2_of_3_agrees_on_one_group_key() {
         let keys = run_dkg(&[1, 2, 3], 2);
@@ -484,5 +641,92 @@ mod tests {
         )
         .expect_err("mismatched merkle root must not produce a signature");
         assert!(err.contains("Invalid signature share"), "got: {err}");
+    }
+
+    /// The invariant that makes resharing useful: shares are redistributed on
+    /// fresh polynomials, but the group key — and therefore the vault address
+    /// and its existing UTXOs — is untouched.
+    #[test]
+    fn reshare_preserves_the_group_key() {
+        let ids = [1u16, 2, 3];
+        let old = run_dkg(&ids, 2);
+        let new = run_reshare(&ids, 2, &old);
+
+        for (k, n) in new.iter().enumerate() {
+            assert_eq!(n.group_key, old[0].group_key, "participant {k}");
+        }
+        assert_ne!(
+            serde_json::to_string(&new[0].key_package).unwrap(),
+            serde_json::to_string(&old[0].key_package).unwrap(),
+            "shares must actually be re-dealt, not returned unchanged"
+        );
+    }
+
+    /// And the refreshed shares must still sign together.
+    #[test]
+    fn reshared_roster_can_still_sign() {
+        use frost::keys::Tweak;
+
+        let keys = run_reshare(&[1, 2, 3], 2, &run_dkg(&[1, 2, 3], 2));
+        let signers = [(1u16, &keys[0]), (2u16, &keys[1])];
+        let root = Some(String::new());
+
+        let (nonces, commitments) = commit(&signers);
+        let sig = sign_aggregate(
+            &commitments,
+            &shares(&signers, &nonces, &commitments, root.clone()),
+            &serde_json::to_string(&keys[0].public_key_package).unwrap(),
+            MSG,
+            root,
+        )
+        .unwrap();
+
+        keys[0]
+            .public_key_package
+            .clone()
+            .tweak(Some(Vec::<u8>::new()))
+            .verifying_key()
+            .verify(
+                &unhex(MSG).unwrap(),
+                &frost::Signature::deserialize(&unhex(&sig).unwrap()).unwrap(),
+            )
+            .expect("post-reshare signature must verify");
+    }
+
+    /// Removing a member works: reshare over the surviving subset, and the
+    /// group key — hence the address and its UTXOs — survives.
+    #[test]
+    fn reshare_can_remove_a_member() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let new = run_reshare(&[1, 2], 2, &old);
+
+        assert_eq!(new[0].group_key, old[0].group_key);
+        assert_eq!(new[1].group_key, old[0].group_key);
+    }
+
+    /// The threshold cannot move. Upstream compares min_signers against the old
+    /// key package and refuses, so a t-of-n vault stays t-of-n for life; only
+    /// the roster changes. Raising or lowering `t` needs a fresh DKG, which
+    /// means a new group key and a new address.
+    ///
+    /// Worth a test rather than a comment: the app's reshare command offers
+    /// threshold changes today, and this is where that stops being possible.
+    #[test]
+    fn threshold_cannot_change_across_a_reshare() {
+        let ids = [1u16, 2, 3];
+        let old = run_dkg(&ids, 2);
+
+        // Rounds 1 and 2 at the NEW threshold succeed; finalising against a
+        // 2-of-3 key package is what fails.
+        let (r1, r2) = reshare_rounds(&ids, 3);
+        let err = reshare_finalize(
+            &serde_json::to_string(&r2[0].secret).unwrap(),
+            &serde_json::to_string(&others_round1(&ids, &r1, 0)).unwrap(),
+            &serde_json::to_string(&round2_for(&ids, &r2, 0, 1)).unwrap(),
+            &kp(&old[0]),
+            &serde_json::to_string(&old[0].public_key_package).unwrap(),
+        )
+        .expect_err("threshold change must be refused");
+        assert!(err.to_lowercase().contains("min"), "got: {err}");
     }
 }
