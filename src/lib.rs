@@ -153,10 +153,12 @@ pub fn dkg_finalize(secret: &str, round1: &str, round2: &str) -> Result<String, 
         frost::keys::dkg::part3(&secret, &unkeyed(r1)?, &unkeyed(r2)?)
             .map_err(|e| format!("dkg finalize: {e}"))?;
 
-    let group_key = hex(&public_key_package
-        .verifying_key()
-        .serialize()
-        .map_err(|e| format!("group key: {e}"))?);
+    let group_key = hex::encode(
+        &public_key_package
+            .verifying_key()
+            .serialize()
+            .map_err(|e| format!("group key: {e}"))?,
+    );
     to_json(&Finalized {
         key_package,
         public_key_package,
@@ -259,23 +261,13 @@ pub fn sign_aggregate(
     )
     .map_err(|e| format!("aggregate: {e}"))?;
 
-    Ok(hex(&sig
-        .serialize()
-        .map_err(|e| format!("signature: {e}"))?))
+    Ok(hex::encode(
+        sig.serialize().map_err(|e| format!("signature: {e}"))?,
+    ))
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
-        return Err("hex string has odd length".to_string());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    hex::decode(s).map_err(|e| format!("bad hex: {e}"))
 }
 
 #[cfg(test)]
@@ -391,6 +383,16 @@ mod tests {
         assert_eq!(keys[0].group_key, keys[1].group_key);
         assert_eq!(keys[1].group_key, keys[2].group_key);
         assert_eq!(keys[0].group_key.len(), 66, "33-byte compressed point");
+    }
+
+    /// The hand-rolled decoder this replaced had two bugs the `hex` crate does
+    /// not: `u8::from_str_radix` accepts a sign, so "+f" parsed as 0x0f, and
+    /// `&s[i..i + 2]` panics when it lands inside a multi-byte char.
+    #[test]
+    fn malformed_hex_is_rejected() {
+        for bad in ["+f+f", "€a", "abc", "zz", " f"] {
+            assert!(unhex(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     /// Pins the assumption `unident` makes about upstream's scalar encoding.
