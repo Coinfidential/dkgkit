@@ -26,6 +26,34 @@ tweak is applied to each signer's key package, so a disagreement produces
 shares the aggregator rejects. Nothing in the types enforces this; a test
 does. Note `None` and `""` mean the same thing — the key-path-only tweak.
 
+## Entropy
+
+`dkg_round1` and `sign_nonce` take an optional hex `extra_entropy` — dice rolls,
+a hardware RNG, a second device. It is folded in **on top of** the OS draw:
+
+```
+seed = SHA-512(os_entropy ‖ extra)[..32]
+```
+
+The OS draw always participates. Bad extra entropy therefore cannot weaken the
+result, while good extra entropy rescues a compromised OS source. A seed that
+*replaced* the OS draw would only move the single point of failure.
+
+A degenerate OS draw (all-zero, or every byte identical) is a hard error rather
+than a warning. Key generation refuses to proceed.
+
+This is shaped by Coldcard's 2026 incident: a 2021 firmware error silently
+routed seed generation from the STM32 hardware RNG to a software PRNG, dropping
+effective entropy from 128 bits to roughly 40. It went unnoticed for five years
+and cost ~1,367 BTC. The device *had* a hardware TRNG — the failure was silent
+substitution, so what matters is never trusting one source and never failing
+quietly.
+
+Threshold generation helps structurally too: a group key is the sum of every
+participant's polynomial, so one honest entropy source among N keeps it
+unpredictable. That does not extend to a participant's own share or nonces,
+which is why per-device entropy still matters.
+
 This crate deliberately contains **no cryptography of its own**: no curve
 arithmetic, no polynomial evaluation, no challenge or binding-factor
 derivation. Those are delegated wholesale, because subtly wrong versions of

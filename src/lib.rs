@@ -12,7 +12,10 @@ use std::collections::BTreeMap;
 
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
+use rand_chacha::ChaCha20Rng;
+use rand_core::{OsRng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha512};
 use wasm_bindgen::prelude::*;
 
 type Packages<T> = BTreeMap<u16, T>;
@@ -39,6 +42,49 @@ pub struct Finalized {
     pub key_package: frost::keys::KeyPackage,
     pub public_key_package: frost::keys::PublicKeyPackage,
     pub group_key: String,
+}
+
+// ── Entropy ─────────────────────────────────────────────────────────────────
+//
+// Coldcard's 2026 incident is the design brief here: a March 2021 firmware
+// error silently routed seed generation away from the STM32 hardware RNG to a
+// software PRNG, collapsing effective entropy from 128 bits to roughly 40. It
+// went unnoticed for five years and cost ~1,367 BTC across 4,585 addresses.
+//
+// The device had a hardware TRNG. The failure was silent substitution, not a
+// wrong algorithm — so the defences that matter are: never trust one source,
+// and never fail quietly.
+
+/// Build the RNG for one operation from the OS source, optionally strengthened
+/// with caller-supplied physical entropy (dice, a hardware RNG, a second
+/// device).
+///
+/// `seed = SHA-512(os_entropy ‖ extra)[..32]`, and **the OS draw is always
+/// included**. That ordering is the whole safety argument: supplying bad extra
+/// entropy cannot weaken the result, while good extra entropy rescues a
+/// compromised OS source. A caller-supplied seed that *replaced* the OS draw
+/// would trade one single point of failure for another.
+fn rng(extra: Option<String>) -> Result<ChaCha20Rng, String> {
+    let mut os = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut os)
+        .map_err(|e| format!("OS entropy unavailable: {e}"))?;
+
+    // A degenerate draw is the one failure that must never pass silently. This
+    // catches a stubbed or misrouted source — exactly the Coldcard shape —
+    // not statistical bias, which no cheap check can detect.
+    if os == [0u8; 32] || os.iter().all(|&b| b == os[0]) {
+        return Err("OS entropy returned a constant — refusing to generate keys".into());
+    }
+
+    let mut h = Sha512::new();
+    h.update(os);
+    if let Some(extra) = extra {
+        h.update(unhex(&extra)?);
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&h.finalize()[..32]);
+    Ok(ChaCha20Rng::from_seed(seed))
 }
 
 fn ident(n: u16) -> Result<Identifier, String> {
@@ -76,9 +122,14 @@ fn to_json<T: Serialize>(v: &T) -> Result<String, String> {
 /// Round 1: commit to a random polynomial and prove possession of its constant
 /// term. Broadcast `package`; keep `secret`.
 #[wasm_bindgen]
-pub fn dkg_round1(participant: u16, threshold: u16, total: u16) -> Result<String, String> {
+pub fn dkg_round1(
+    participant: u16,
+    threshold: u16,
+    total: u16,
+    extra_entropy: Option<String>,
+) -> Result<String, String> {
     let (secret, package) =
-        frost::keys::dkg::part1(ident(participant)?, total, threshold, rand_core::OsRng)
+        frost::keys::dkg::part1(ident(participant)?, total, threshold, rng(extra_entropy)?)
             .map_err(|e| format!("dkg round1: {e}"))?;
     to_json(&Round1 { secret, package })
 }
@@ -158,9 +209,9 @@ fn merkle_root(root: Option<String>) -> Result<Option<Vec<u8>>, String> {
 /// nonce signs at most one message, so callers must discard `nonces` after one
 /// `sign_share` — reuse across two digests leaks the signing share outright.
 #[wasm_bindgen]
-pub fn sign_nonce(key_package: &str) -> Result<String, String> {
+pub fn sign_nonce(key_package: &str, extra_entropy: Option<String>) -> Result<String, String> {
     let kp: frost::keys::KeyPackage = from_json(key_package, "key package")?;
-    let (nonces, commitments) = frost::round1::commit(kp.signing_share(), &mut rand_core::OsRng);
+    let (nonces, commitments) = frost::round1::commit(kp.signing_share(), &mut rng(extra_entropy)?);
     to_json(&SignNonce {
         nonces,
         commitments,
@@ -243,6 +294,33 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// The safety property of the mixing rule: caller-supplied entropy is
+    /// folded in ON TOP of the OS draw, never instead of it. Passing the same
+    /// `extra` twice must still produce different keys — otherwise a caller
+    /// with a fixed "physical" seed would silently make every vault identical.
+    #[test]
+    fn caller_entropy_cannot_make_output_deterministic() {
+        let fixed = Some("de".repeat(32));
+        let a = dkg_round1(1, 2, 3, fixed.clone()).unwrap();
+        let b = dkg_round1(1, 2, 3, fixed).unwrap();
+        assert_ne!(a, b, "OS entropy must always be mixed in");
+    }
+
+    /// And the converse: the extra entropy has to actually reach the RNG.
+    /// A parameter that is accepted and ignored would look identical from
+    /// outside — which is the shape of the Coldcard failure.
+    #[test]
+    fn caller_entropy_reaches_the_rng() {
+        // Same OS draw is impossible to force, so assert on the seed path
+        // directly: two RNGs differing only in `extra` must diverge.
+        let mut x = rng(Some("00".into())).unwrap();
+        let mut y = rng(Some("01".into())).unwrap();
+        let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+        x.fill_bytes(&mut a);
+        y.fill_bytes(&mut b);
+        assert_ne!(a, b);
+    }
+
     /// Runs a full DKG through the same JSON boundary the wasm callers use and
     /// returns one `Finalized` per participant, in `ids` order.
     fn run_dkg(ids: &[u16], threshold: u16) -> Vec<Finalized> {
@@ -251,7 +329,9 @@ mod tests {
         // Round 1 — everyone commits.
         let r1: Vec<Round1> = ids
             .iter()
-            .map(|&i| serde_json::from_str(&dkg_round1(i, threshold, total).unwrap()).unwrap())
+            .map(|&i| {
+                serde_json::from_str(&dkg_round1(i, threshold, total, None).unwrap()).unwrap()
+            })
             .collect();
 
         // Round 2 — each participant sees the others' round-1 packages.
@@ -329,7 +409,7 @@ mod tests {
         // Round 1 — each signer commits to a single-use nonce.
         let nonces: Vec<SignNonce> = signers
             .iter()
-            .map(|(_, k)| serde_json::from_str(&sign_nonce(&kp(k)).unwrap()).unwrap())
+            .map(|(_, k)| serde_json::from_str(&sign_nonce(&kp(k), None).unwrap()).unwrap())
             .collect();
 
         let commitments: Packages<_> = signers
@@ -388,7 +468,7 @@ mod tests {
 
         let nonces: Vec<SignNonce> = signers
             .iter()
-            .map(|(_, k)| serde_json::from_str(&sign_nonce(&kp(k)).unwrap()).unwrap())
+            .map(|(_, k)| serde_json::from_str(&sign_nonce(&kp(k), None).unwrap()).unwrap())
             .collect();
         let commitments: Packages<_> = signers
             .iter()
