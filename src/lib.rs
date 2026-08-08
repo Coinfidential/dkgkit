@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 
-use frost_secp256k1_tr as frost;
 use frost::Identifier;
+use frost_secp256k1_tr as frost;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -89,12 +89,16 @@ pub fn dkg_round1(participant: u16, threshold: u16, total: u16) -> Result<String
 #[wasm_bindgen]
 pub fn dkg_round2(secret: &str, round1: &str) -> Result<String, JsError> {
     let secret: frost::keys::dkg::round1::SecretPackage = from_json(secret, "round1 secret")?;
-    let received: Packages<frost::keys::dkg::round1::Package> = from_json(round1, "round1 packages")?;
+    let received: Packages<frost::keys::dkg::round1::Package> =
+        from_json(round1, "round1 packages")?;
     let ids: Vec<u16> = received.keys().copied().collect();
 
     let (secret, packages) = frost::keys::dkg::part2(secret, &unkeyed(received)?)
         .map_err(|e| JsError::new(&format!("dkg round2: {e}")))?;
-    to_json(&Round2 { secret, packages: keyed(packages, &ids)? })
+    to_json(&Round2 {
+        secret,
+        packages: keyed(packages, &ids)?,
+    })
 }
 
 /// Round 3: verify the shares addressed to this participant and derive the long
@@ -110,9 +114,15 @@ pub fn dkg_finalize(secret: &str, round1: &str, round2: &str) -> Result<String, 
         frost::keys::dkg::part3(&secret, &unkeyed(r1)?, &unkeyed(r2)?)
             .map_err(|e| JsError::new(&format!("dkg finalize: {e}")))?;
 
-    let group_key = hex(&public_key_package.verifying_key().serialize()
+    let group_key = hex(&public_key_package
+        .verifying_key()
+        .serialize()
         .map_err(|e| JsError::new(&format!("group key: {e}")))?);
-    to_json(&Finalized { key_package, public_key_package, group_key })
+    to_json(&Finalized {
+        key_package,
+        public_key_package,
+        group_key,
+    })
 }
 
 fn hex(bytes: &[u8]) -> String {
