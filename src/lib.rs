@@ -371,6 +371,170 @@ pub fn redistribute_deal(
     })
 }
 
+/// The verifying share every new member ends up with, derived from the dealers'
+/// **public** commitments alone: `Y'_j = Σ_d λ_d · Φ_d(j)`.
+///
+/// Carries checks (2) and (3) from [`redistribute_finalize`], because both are
+/// properties of the commitments rather than of any secret. Keeping them here
+/// means a verifier who holds no share applies exactly the same rules as a
+/// recipient who does.
+fn combine_deals(
+    commitments: &BTreeMap<Identifier, &frost::keys::VerifiableSecretSharingCommitment>,
+    old_pkp: &frost::keys::PublicKeyPackage,
+    new_idents: &[Identifier],
+    new_threshold: u16,
+) -> Result<BTreeMap<Identifier, Element_>, String> {
+    if commitments.is_empty() {
+        return Err("redistribute: no deals".into());
+    }
+
+    let dealers: BTreeSet<Identifier> = commitments.keys().copied().collect();
+    let old_shares = old_pkp.verifying_shares();
+
+    let mut new_shares: BTreeMap<Identifier, Element_> =
+        new_idents.iter().map(|&j| (j, identity())).collect();
+    let mut anchor = identity();
+
+    for (&dealer, commitment) in commitments {
+        let dealer_num = unident(&dealer)?;
+
+        // A shorter commitment means a lower-degree polynomial, i.e. a vault
+        // that reconstructs below the threshold everyone agreed to.
+        // Fully qualified: `commitment` is a double reference here and serde's
+        // `serialize` would otherwise win the method lookup.
+        let degree = frost::keys::VerifiableSecretSharingCommitment::serialize(commitment)
+            .map_err(|e| format!("dealer {dealer_num}: malformed commitment: {e}"))?;
+        if degree.len() != new_threshold as usize {
+            return Err(format!("dealer {dealer_num} dealt at the wrong threshold"));
+        }
+
+        // (2) Binding: the commitment's constant term must be this dealer's
+        // real old verifying share. Without it a dealer could re-split some
+        // OTHER secret — the Feldman check would not notice, because that
+        // polynomial is perfectly self-consistent.
+        let dealt_from = frost::VerifyingKey::from_commitment(commitment)
+            .map_err(|e| format!("dealer {dealer_num}: malformed commitment: {e}"))?;
+        let old = old_shares
+            .get(&dealer)
+            .ok_or_else(|| format!("dealer {dealer_num} is not in the old roster"))?;
+        if dealt_from.to_element() != old.to_element() {
+            return Err(format!(
+                "dealer {dealer_num} re-split a secret that is not its own share"
+            ));
+        }
+
+        let lambda = compute_lagrange_coefficient(&dealers, None, dealer)
+            .map_err(|e| format!("lagrange for dealer {dealer_num}: {e}"))?;
+
+        anchor += old.to_element() * lambda;
+        for (&j, acc) in new_shares.iter_mut() {
+            let phi = frost::keys::VerifyingShare::from_commitment(j, commitment);
+            *acc += phi.to_element() * lambda;
+        }
+    }
+
+    // (3) The dealer set must actually be authorised: below `t_old` dealers the
+    // interpolation lands somewhere other than the group key.
+    if anchor != old_pkp.verifying_key().to_element() {
+        return Err(
+            "redistribute: dealer set does not reconstruct the group key \
+             (fewer than the threshold, or a forged roster)"
+                .into(),
+        );
+    }
+
+    Ok(new_shares)
+}
+
+/// The public key package a DKG produced, from its round-1 packages alone.
+///
+/// **Nobody has to be trusted to hand this over.** Round-1 packages are public
+/// and already part of the ceremony transcript, and `Y_i = Σ_j Φ_j(i)` — so the
+/// package is a *function of the transcript*, not a claim about it. A member who
+/// was not present at the DKG, which is exactly what a member being added by a
+/// redistribution is, can therefore obtain it without trusting whoever offered
+/// it.
+///
+/// Check the result against the group key the ceremony certified before using
+/// it; that is what ties this derivation to the vault you think you are joining.
+#[wasm_bindgen]
+pub fn dkg_public_key_package(round1: &str) -> Result<String, String> {
+    let pkgs: Packages<frost::keys::dkg::round1::Package> = from_json(round1, "round1 packages")?;
+    if pkgs.is_empty() {
+        return Err("no round1 packages".into());
+    }
+    let by_id = unkeyed(pkgs)?;
+    let commitments: BTreeMap<Identifier, &frost::keys::VerifiableSecretSharingCommitment> =
+        by_id.iter().map(|(&id, p)| (id, p.commitment())).collect();
+
+    let pkp = frost::keys::PublicKeyPackage::from_dkg_commitments(&commitments)
+        .map_err(|e| format!("derive public keys: {e}"))?;
+
+    // Summing the commitments gives the UNtweaked joint key P. It is not what
+    // the vault uses.
+    //
+    // `Secp256K1Sha256TR::post_dkg` adds BIP-341's unspendable-script-path
+    // tweak to every DKG output — `Q = P + H_TapTweak(P)·G` — so that no peer
+    // can slip a rogue tapscript tweak into the joint key. `part3` applies it
+    // before returning, so a derivation that stops at the sum reproduces a key
+    // nobody signs with, differing from the real one in x as well as parity.
+    //
+    // This must mirror `post_dkg` exactly. If upstream ever changes what it
+    // does after a DKG, `the_dkg_public_key_package_is_derivable_from_the_log`
+    // is what notices.
+    use frost::keys::Tweak;
+    to_json(&pkp.tweak::<&[u8]>(None))
+}
+
+/// The public key package a redistribution produces, from the dealers' public
+/// commitments alone.
+///
+/// The sibling of [`dkg_public_key_package`] for every later generation. Publish
+/// each dealer's commitment and the whole chain stays derivable: generation 0
+/// from the DKG round-1 packages, generation k from generation k−1's package
+/// plus generation k's commitments. No participant is ever the source of truth
+/// for public key material.
+///
+/// Holds no secrets, so a member who is only watching can check the outcome of
+/// a redistribution they took no part in.
+#[wasm_bindgen]
+pub fn redistribute_public_key_package(
+    commitments: &str,
+    old_public_key_package: &str,
+    new_threshold: u16,
+    new_participants: &str,
+) -> Result<String, String> {
+    let by_num: Packages<frost::keys::VerifiableSecretSharingCommitment> =
+        from_json(commitments, "dealer commitments")?;
+    let old_pkp: frost::keys::PublicKeyPackage =
+        from_json(old_public_key_package, "old public keys")?;
+    let new_idents = roster(new_participants, "new roster")?;
+
+    if new_threshold < 2 || (new_threshold as usize) > new_idents.len() {
+        return Err(format!(
+            "threshold {new_threshold} is outside 2..={}",
+            new_idents.len()
+        ));
+    }
+
+    let by_id: BTreeMap<Identifier, &frost::keys::VerifiableSecretSharingCommitment> = by_num
+        .iter()
+        .map(|(&n, c)| Ok((ident(n)?, c)))
+        .collect::<Result<_, String>>()?;
+
+    let new_shares = combine_deals(&by_id, &old_pkp, &new_idents, new_threshold)?;
+    let verifying_shares: BTreeMap<Identifier, frost::keys::VerifyingShare> = new_shares
+        .into_iter()
+        .map(|(j, e)| (j, frost::keys::VerifyingShare::new(e)))
+        .collect();
+
+    to_json(&frost::keys::PublicKeyPackage::new(
+        verifying_shares,
+        *old_pkp.verifying_key(),
+        Some(new_threshold),
+    ))
+}
+
 /// Redistribution, recipient half. Combine the sub-shares addressed to this
 /// participant into a share of the unchanged group key.
 ///
@@ -442,65 +606,34 @@ pub fn redistribute_finalize(
         .map(|&n| ident(n))
         .collect::<Result<_, _>>()?;
 
-    let old_shares = old_pkp.verifying_shares();
+    let commitments: BTreeMap<Identifier, &frost::keys::VerifiableSecretSharingCommitment> =
+        received
+            .iter()
+            .map(|(&n, d)| Ok((ident(n)?, d.commitment())))
+            .collect::<Result<_, String>>()?;
+
+    // Checks (2) and (3), and every new verifying share, from public material
+    // only. Shared with `redistribute_public_key_package` so the two can never
+    // disagree about what a given set of deals produces.
+    let new_shares = combine_deals(&commitments, &old_pkp, &new_idents, new_threshold)?;
+
     let mut share = zero();
-    let mut new_shares: BTreeMap<Identifier, Element_> =
-        new_idents.iter().map(|&j| (j, identity())).collect();
-    let mut anchor = identity();
-
     for (&dealer_num, deal) in &received {
-        let dealer = ident(dealer_num)?;
-
         if *deal.identifier() != me {
             return Err(format!(
                 "dealer {dealer_num} sent a share addressed to someone else"
             ));
         }
-        // A shorter commitment means a lower-degree polynomial, i.e. a vault
-        // that reconstructs below the threshold everyone agreed to.
-        if deal
-            .commitment()
-            .serialize()
-            .map_err(|e| e.to_string())?
-            .len()
-            != new_threshold as usize
-        {
-            return Err(format!("dealer {dealer_num} dealt at the wrong threshold"));
-        }
 
-        // (1) Feldman. Also hands back the commitment's constant term.
-        let (_, dealt_from) = deal
-            .verify()
+        // (1) Feldman: this sub-share lies on the polynomial its dealer
+        // committed to. The only check needing secret material, hence the only
+        // one that cannot live in `combine_deals`.
+        deal.verify()
             .map_err(|e| format!("dealer {dealer_num}: invalid share: {e}"))?;
 
-        // (2) Binding: that constant term must be the dealer's real old share.
-        let old = old_shares
-            .get(&dealer)
-            .ok_or_else(|| format!("dealer {dealer_num} is not in the old roster"))?;
-        if dealt_from.to_element() != old.to_element() {
-            return Err(format!(
-                "dealer {dealer_num} re-split a secret that is not its own share"
-            ));
-        }
-
-        let lambda = compute_lagrange_coefficient(&dealers, None, dealer)
+        let lambda = compute_lagrange_coefficient(&dealers, None, ident(dealer_num)?)
             .map_err(|e| format!("lagrange for dealer {dealer_num}: {e}"))?;
-
         share += lambda * deal.signing_share().to_scalar();
-        anchor += old.to_element() * lambda;
-        for (&j, acc) in new_shares.iter_mut() {
-            let phi = frost::keys::VerifyingShare::from_commitment(j, deal.commitment());
-            *acc += phi.to_element() * lambda;
-        }
-    }
-
-    // (3) The dealer set must actually be authorised.
-    if anchor != old_pkp.verifying_key().to_element() {
-        return Err(
-            "redistribute: dealer set does not reconstruct the group key \
-                    (fewer than the threshold, or a forged roster)"
-                .into(),
-        );
     }
 
     // Belt and braces: the share we just built must match the verifying share
@@ -684,6 +817,12 @@ mod tests {
     /// Runs a full DKG through the same JSON boundary the wasm callers use and
     /// returns one `Finalized` per participant, in `ids` order.
     fn run_dkg(ids: &[u16], threshold: u16) -> Vec<Finalized> {
+        run_dkg_logged(ids, threshold).0
+    }
+
+    /// The same run, also returning the round-1 packages as the ceremony log
+    /// would carry them — public, one per participant, keyed by id.
+    fn run_dkg_logged(ids: &[u16], threshold: u16) -> (Vec<Finalized>, String) {
         let total = ids.len() as u16;
 
         // Round 1 — everyone commits.
@@ -714,7 +853,8 @@ mod tests {
             .collect();
 
         // Round 3 — each participant collects the shares addressed to it.
-        ids.iter()
+        let keys = ids
+            .iter()
             .enumerate()
             .map(|(k, &me)| {
                 let r1_others: Packages<_> = ids
@@ -740,7 +880,14 @@ mod tests {
                 )
                 .unwrap()
             })
-            .collect()
+            .collect();
+
+        let log: Packages<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(j, &id)| (id, r1[j].package.clone()))
+            .collect();
+        (keys, serde_json::to_string(&log).unwrap())
     }
 
     /// Signing round 1 for a set of signers. Returns their nonces alongside the
@@ -1112,6 +1259,101 @@ mod tests {
         let err = redistribute_deal(&kp(&old[0]), "[1,2,3,3]", 2, None)
             .expect_err("a duplicate participant must be refused");
         assert!(err.contains("duplicate participant"), "got: {err}");
+    }
+
+    /// The public key package is a FUNCTION of the round-1 transcript, not a
+    /// claim somebody makes about it. Anyone holding the log — including a
+    /// member who was not at the DKG — derives the same one the participants
+    /// did, so nobody has to be trusted to hand it over.
+    #[test]
+    fn the_dkg_public_key_package_is_derivable_from_the_log() {
+        // `log` is exactly what the ceremony log already holds: one public
+        // round-1 package per participant, and nothing secret.
+        let (keys, log) = run_dkg_logged(&[1, 2, 3], 2);
+
+        let derived: frost::keys::PublicKeyPackage =
+            serde_json::from_str(&dkg_public_key_package(&log).unwrap()).unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&derived).unwrap(),
+            serde_json::to_string(&keys[0].public_key_package).unwrap(),
+            "derived package must equal the participants' own"
+        );
+    }
+
+    /// And the same for every later generation: publish the dealers'
+    /// commitments and an observer can check a redistribution it took no part
+    /// in — no share, no secret, same answer.
+    #[test]
+    fn the_redistributed_public_key_package_is_derivable_from_commitments() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let new_ids = [1u16, 2, 3, 4];
+        let dealers = [(1u16, &old[0]), (2u16, &old[1])];
+
+        // ONE set of deals, used by both the recipient and the observer —
+        // dealing twice would compare two different redistributions.
+        let deals = deals_from(&dealers, &new_ids, 3);
+        let roster = serde_json::to_string(&new_ids).unwrap();
+        let pkp = serde_json::to_string(&old[0].public_key_package).unwrap();
+
+        let participants: Vec<Finalized> = new_ids
+            .iter()
+            .map(|&me| {
+                serde_json::from_str(
+                    &redistribute_finalize(me, &deals_for(&deals, me), &pkp, 3, &roster).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        // Commitments are public — they ride inside every SecretShare and are
+        // identical across all of them.
+        let commitments: Packages<frost::keys::VerifiableSecretSharingCommitment> = deals
+            .iter()
+            .map(|d| (d.dealer, d.shares[&new_ids[0]].commitment().clone()))
+            .collect();
+
+        let derived: frost::keys::PublicKeyPackage = serde_json::from_str(
+            &redistribute_public_key_package(
+                &serde_json::to_string(&commitments).unwrap(),
+                &serde_json::to_string(&old[0].public_key_package).unwrap(),
+                3,
+                &serde_json::to_string(&new_ids).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_string(&derived).unwrap(),
+            serde_json::to_string(&participants[0].public_key_package).unwrap(),
+            "an observer derives what the recipients derived"
+        );
+    }
+
+    /// The derivation carries the same refusals as finalisation — it is the
+    /// same code. A watcher must not certify a redistribution that a recipient
+    /// would have rejected.
+    #[test]
+    fn the_public_derivation_refuses_a_sub_threshold_dealer_set() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let deals = deals_from(&[(1, &old[0])], &[1, 2, 3], 2);
+        let commitments: Packages<frost::keys::VerifiableSecretSharingCommitment> = deals
+            .iter()
+            .map(|d| (d.dealer, d.shares[&1].commitment().clone()))
+            .collect();
+
+        let err = redistribute_public_key_package(
+            &serde_json::to_string(&commitments).unwrap(),
+            &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            2,
+            "[1,2,3]",
+        )
+        .expect_err("one dealer out of two must be refused here too");
+        assert!(
+            err.contains("does not reconstruct the group key"),
+            "got: {err}"
+        );
     }
 
     /// Two recipients folding in DIFFERENT dealer sets land on different
