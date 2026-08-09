@@ -1,0 +1,35 @@
+#!/bin/sh
+# Format staged Rust before it becomes a commit.
+#
+# `cargo fmt --check` is the first thing CI runs, and a red build over
+# whitespace tells you nothing you wanted to know. This runs the formatter
+# locally instead of reporting on it.
+#
+# Only files that were ALREADY staged get re-staged. If the formatter also
+# touches something you left unstaged on purpose, that change stays unstaged —
+# a commit hook must never quietly enlarge the commit you asked for.
+#
+# Enable once per clone:
+#
+#     git config core.hooksPath .githooks
+#
+# Skip it for one commit with `git commit --no-verify`.
+
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+[ -z "$staged" ] && exit 0
+
+command -v cargo >/dev/null 2>&1 || {
+	echo "pre-commit: cargo not on PATH, skipping rustfmt" >&2
+	exit 0
+}
+
+cargo fmt
+
+# Re-stage only what was staged to begin with, and only if it still exists.
+for f in $staged; do
+	[ -f "$f" ] && git add -- "$f"
+done
+
+exit 0

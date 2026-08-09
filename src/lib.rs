@@ -3,14 +3,22 @@
 //! Three functions, one per DKG round. Everything cryptographic is delegated to
 //! `frost-secp256k1-tr` (Zcash Foundation's RFC 9591 implementation, BIP-340/341
 //! variant). This crate only marshals JSON across the wasm boundary — it derives
-//! no challenges, sums no nonces and touches no scalars.
+//! no challenges, sums no nonces, evaluates no polynomial and implements no
+//! field arithmetic.
+//!
+//! [`redistribute_finalize`] is the one place that combines scalars and group
+//! elements, because handing a vault to a different roster means weighting each
+//! dealer's contribution by its Lagrange coefficient and no upstream function
+//! does that. The coefficients, the VSS evaluation and the arithmetic itself
+//! are all still frost-core's; only the summation is here.
 //!
 //! Participants are plain `u16` ids, so nothing here depends on how the round
 //! packages are delivered. Transport is somebody else's problem.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use frost::Identifier;
+use frost_core::compute_lagrange_coefficient;
 use frost_secp256k1_tr as frost;
 use rand_chacha::ChaCha20Rng;
 use rand_core::{OsRng, RngCore, SeedableRng};
@@ -237,6 +245,288 @@ pub fn reshare_finalize(
         old_kp,
     )
     .map_err(|e| format!("reshare finalize: {e}"))?;
+
+    let group_key = hex::encode(
+        public_key_package
+            .verifying_key()
+            .serialize()
+            .map_err(|e| format!("group key: {e}"))?,
+    );
+    to_json(&Finalized {
+        key_package,
+        public_key_package,
+        group_key,
+    })
+}
+
+// ── Redistribution ──────────────────────────────────────────────────────────
+//
+// `reshare_*` above cannot add a member and cannot move the threshold, because
+// upstream's `refresh_dkg_shares` folds the refreshing packages into an
+// EXISTING key package — a participant who holds none cannot finalise — and it
+// compares `min_signers` against that package and refuses a change.
+//
+// Redistribution lifts both limits. Each dealer re-splits its OWN share f(i) on
+// a fresh polynomial across the NEW roster at the NEW threshold; each recipient
+// sums the sub-shares it receives, weighted by each dealer's Lagrange
+// coefficient over the dealer set. Because Σ λᵢ·f(i) = f(0) for any authorised
+// dealer set, the new shares lie on a fresh degree-(t_new−1) polynomial through
+// the SAME secret: the group key, the taproot output key and therefore the
+// vault address and its UTXOs are all unchanged, and no party ever reconstructs
+// f(0).
+//
+// A recipient needs no prior key package. That is what makes adding a member
+// possible.
+//
+// Every scalar and group operation below comes from frost-core's own
+// `internals` surface — `compute_lagrange_coefficient`, VSS evaluation via
+// `VerifyingShare::from_commitment`, and the `Field`/`Group` traits. This crate
+// still derives no challenges, evaluates no polynomial by hand and writes no
+// field arithmetic.
+
+type Ctx = frost::Secp256K1Sha256TR;
+type Group_ = <Ctx as frost_core::Ciphersuite>::Group;
+type Field_ = <Group_ as frost_core::Group>::Field;
+type Scalar_ = frost_core::Scalar<Ctx>;
+type Element_ = frost_core::Element<Ctx>;
+
+fn zero() -> Scalar_ {
+    <Field_ as frost_core::Field>::zero()
+}
+
+fn identity() -> Element_ {
+    <Group_ as frost_core::Group>::identity()
+}
+
+fn generator() -> Element_ {
+    <Group_ as frost_core::Group>::generator()
+}
+
+/// One dealer's contribution: a fresh Shamir split of that dealer's own share,
+/// addressed to the new roster.
+///
+/// `shares` is keyed by NEW participant id and each entry is secret to its
+/// recipient — the transport must deliver them pairwise, exactly like round-2
+/// DKG packages. The commitment travelling inside each share is public and is
+/// identical across all of them.
+#[derive(Serialize, Deserialize)]
+pub struct Deal {
+    /// The dealer's participant id in the OLD roster.
+    pub dealer: u16,
+    pub shares: Packages<frost::keys::SecretShare>,
+}
+
+/// Parse a roster, rejecting duplicates — a repeated id would otherwise be
+/// silently deduplicated and change the effective `n`.
+fn roster(json: &str, what: &str) -> Result<Vec<Identifier>, String> {
+    let ids: Vec<u16> = from_json(json, what)?;
+    let idents: Vec<Identifier> = ids.iter().map(|&n| ident(n)).collect::<Result<_, _>>()?;
+    if idents.iter().collect::<BTreeSet<_>>().len() != idents.len() {
+        return Err(format!("duplicate participant in {what}"));
+    }
+    Ok(idents)
+}
+
+/// Redistribution, dealer half. Re-split this participant's own share across
+/// `new_participants` at `new_threshold`.
+///
+/// Any `t` holders of a current share can act as dealers; a departing member
+/// need not take part, which is what makes this a recovery path for a lost
+/// device. Members being ADDED are recipients only and supply nothing here.
+#[wasm_bindgen]
+pub fn redistribute_deal(
+    old_key_package: &str,
+    new_participants: &str,
+    new_threshold: u16,
+    extra_entropy: Option<String>,
+) -> Result<String, String> {
+    let kp: frost::keys::KeyPackage = from_json(old_key_package, "old key package")?;
+    let new_idents = roster(new_participants, "new roster")?;
+
+    if (new_threshold as usize) > new_idents.len() {
+        return Err(format!(
+            "threshold {new_threshold} exceeds the new roster size {}",
+            new_idents.len()
+        ));
+    }
+
+    // The dealer's share becomes the constant term of its fresh polynomial.
+    // `from_scalar` rejects a zero scalar, which cannot occur for a real share
+    // but would silently produce a degenerate split if it did.
+    let secret = frost::SigningKey::from_scalar(kp.signing_share().to_scalar())
+        .map_err(|e| format!("share is not a usable scalar: {e}"))?;
+
+    let (shares, _) = frost::keys::split(
+        &secret,
+        new_idents.len() as u16,
+        new_threshold,
+        frost::keys::IdentifierList::Custom(&new_idents),
+        &mut rng(extra_entropy)?,
+    )
+    .map_err(|e| format!("redistribute deal: {e}"))?;
+
+    to_json(&Deal {
+        dealer: unident(kp.identifier())?,
+        shares: keyed(shares)?,
+    })
+}
+
+/// Redistribution, recipient half. Combine the sub-shares addressed to this
+/// participant into a share of the unchanged group key.
+///
+/// `deals` maps DEALER id → the [`frost::keys::SecretShare`] that dealer
+/// addressed to `participant`.
+///
+/// Three things are checked, and all three matter:
+///
+/// 1. **Feldman/VSS** — each sub-share lies on the polynomial its dealer
+///    committed to. Catches a dealer sending one recipient a share off its own
+///    curve.
+/// 2. **Dealer binding** — each dealer's commitment constant term equals that
+///    dealer's verifying share in the OLD public key package. Without this a
+///    dealer could re-split *some other* secret and silently move the group
+///    key; the Feldman check alone would not notice, because that polynomial is
+///    internally consistent.
+/// 3. **Group-key invariant** — the dealer set's old verifying shares
+///    interpolate to the old verifying key. This is what proves the dealer set
+///    is authorised: with fewer than `t_old` dealers the interpolation lands
+///    somewhere else, so a sub-threshold group cannot redistribute.
+///
+/// # Every recipient must combine the SAME dealer set
+///
+/// The caller decides which dealers to fold in, and that choice is part of the
+/// ceremony rather than of this function. Two recipients using different dealer
+/// sets get shares on **different** polynomials — both passing through the same
+/// secret at zero, so both report the expected `group_key`, and neither can
+/// sign with the other.
+///
+/// Nothing here can detect that: each recipient's own view is internally
+/// consistent, and check (3) passes for any authorised set. The failure appears
+/// later, as signature shares that will not aggregate — fail-closed, but
+/// remote from its cause. `divergent_dealer_sets_produce_incompatible_shares`
+/// pins the behaviour so it is discovered here rather than in a vault.
+///
+/// The ceremony layer owns this: pin the dealer set when the redistribution
+/// opens, and hand every recipient the same one.
+#[wasm_bindgen]
+pub fn redistribute_finalize(
+    participant: u16,
+    deals: &str,
+    old_public_key_package: &str,
+    new_threshold: u16,
+    new_participants: &str,
+) -> Result<String, String> {
+    let me = ident(participant)?;
+    let received: Packages<frost::keys::SecretShare> = from_json(deals, "deals")?;
+    let old_pkp: frost::keys::PublicKeyPackage =
+        from_json(old_public_key_package, "old public keys")?;
+    let new_idents = roster(new_participants, "new roster")?;
+
+    if received.is_empty() {
+        return Err("redistribute: no deals".into());
+    }
+    if !new_idents.contains(&me) {
+        return Err(format!(
+            "participant {participant} is not in the new roster"
+        ));
+    }
+    if new_threshold < 2 || (new_threshold as usize) > new_idents.len() {
+        return Err(format!(
+            "threshold {new_threshold} is outside 2..={}",
+            new_idents.len()
+        ));
+    }
+
+    let dealers: BTreeSet<Identifier> = received
+        .keys()
+        .map(|&n| ident(n))
+        .collect::<Result<_, _>>()?;
+
+    let old_shares = old_pkp.verifying_shares();
+    let mut share = zero();
+    let mut new_shares: BTreeMap<Identifier, Element_> =
+        new_idents.iter().map(|&j| (j, identity())).collect();
+    let mut anchor = identity();
+
+    for (&dealer_num, deal) in &received {
+        let dealer = ident(dealer_num)?;
+
+        if *deal.identifier() != me {
+            return Err(format!(
+                "dealer {dealer_num} sent a share addressed to someone else"
+            ));
+        }
+        // A shorter commitment means a lower-degree polynomial, i.e. a vault
+        // that reconstructs below the threshold everyone agreed to.
+        if deal
+            .commitment()
+            .serialize()
+            .map_err(|e| e.to_string())?
+            .len()
+            != new_threshold as usize
+        {
+            return Err(format!("dealer {dealer_num} dealt at the wrong threshold"));
+        }
+
+        // (1) Feldman. Also hands back the commitment's constant term.
+        let (_, dealt_from) = deal
+            .verify()
+            .map_err(|e| format!("dealer {dealer_num}: invalid share: {e}"))?;
+
+        // (2) Binding: that constant term must be the dealer's real old share.
+        let old = old_shares
+            .get(&dealer)
+            .ok_or_else(|| format!("dealer {dealer_num} is not in the old roster"))?;
+        if dealt_from.to_element() != old.to_element() {
+            return Err(format!(
+                "dealer {dealer_num} re-split a secret that is not its own share"
+            ));
+        }
+
+        let lambda = compute_lagrange_coefficient(&dealers, None, dealer)
+            .map_err(|e| format!("lagrange for dealer {dealer_num}: {e}"))?;
+
+        share += lambda * deal.signing_share().to_scalar();
+        anchor += old.to_element() * lambda;
+        for (&j, acc) in new_shares.iter_mut() {
+            let phi = frost::keys::VerifyingShare::from_commitment(j, deal.commitment());
+            *acc += phi.to_element() * lambda;
+        }
+    }
+
+    // (3) The dealer set must actually be authorised.
+    if anchor != old_pkp.verifying_key().to_element() {
+        return Err(
+            "redistribute: dealer set does not reconstruct the group key \
+                    (fewer than the threshold, or a forged roster)"
+                .into(),
+        );
+    }
+
+    // Belt and braces: the share we just built must match the verifying share
+    // derived independently from the commitments.
+    if new_shares[&me] != generator() * share {
+        return Err("redistribute: derived share disagrees with its commitment".into());
+    }
+
+    let signing_share = frost::keys::SigningShare::new(share);
+    let verifying_shares: BTreeMap<Identifier, frost::keys::VerifyingShare> = new_shares
+        .into_iter()
+        .map(|(j, e)| (j, frost::keys::VerifyingShare::new(e)))
+        .collect();
+
+    let key_package = frost::keys::KeyPackage::new(
+        me,
+        signing_share,
+        verifying_shares[&me],
+        *old_pkp.verifying_key(),
+        new_threshold,
+    );
+    let public_key_package = frost::keys::PublicKeyPackage::new(
+        verifying_shares,
+        *old_pkp.verifying_key(),
+        Some(new_threshold),
+    );
 
     let group_key = hex::encode(
         public_key_package
@@ -557,6 +847,351 @@ mod tests {
                 .unwrap()
             })
             .collect()
+    }
+
+    /// Sign with `signers` and verify the aggregate against the BIP-341-tweaked
+    /// output key. A roster that cannot do this is not a working vault, whatever
+    /// its group key says.
+    fn sign_and_verify(signers: &[(u16, &Finalized)]) {
+        use frost::keys::Tweak;
+        let root = Some(String::new());
+
+        let (nonces, commitments) = commit(signers);
+        let sig = sign_aggregate(
+            &commitments,
+            &shares(signers, &nonces, &commitments, root.clone()),
+            &serde_json::to_string(&signers[0].1.public_key_package).unwrap(),
+            MSG,
+            root,
+        )
+        .unwrap();
+
+        signers[0]
+            .1
+            .public_key_package
+            .clone()
+            .tweak(Some(Vec::<u8>::new()))
+            .verifying_key()
+            .verify(
+                &unhex(MSG).unwrap(),
+                &frost::Signature::deserialize(&unhex(&sig).unwrap()).unwrap(),
+            )
+            .expect("signature must verify against the tweaked output key");
+    }
+
+    /// Every dealer's deal, at `new_t` over `new_ids`.
+    fn deals_from(dealers: &[(u16, &Finalized)], new_ids: &[u16], new_t: u16) -> Vec<Deal> {
+        let new_json = serde_json::to_string(new_ids).unwrap();
+        dealers
+            .iter()
+            .map(|(_, k)| {
+                serde_json::from_str(&redistribute_deal(&kp(k), &new_json, new_t, None).unwrap())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// The sub-shares addressed to `me`, keyed by dealer.
+    fn deals_for(deals: &[Deal], me: u16) -> String {
+        let mine: Packages<frost::keys::SecretShare> = deals
+            .iter()
+            .map(|d| (d.dealer, d.shares[&me].clone()))
+            .collect();
+        serde_json::to_string(&mine).unwrap()
+    }
+
+    /// One redistribution: `dealers` (any authorised subset of the old roster)
+    /// hand the vault to `new_ids` at threshold `new_t`.
+    fn run_redistribute(
+        dealers: &[(u16, &Finalized)],
+        old_pkp: &Finalized,
+        new_ids: &[u16],
+        new_t: u16,
+    ) -> Vec<Finalized> {
+        let deals = deals_from(dealers, new_ids, new_t);
+        let new_json = serde_json::to_string(new_ids).unwrap();
+        let pkp = serde_json::to_string(&old_pkp.public_key_package).unwrap();
+
+        new_ids
+            .iter()
+            .map(|&me| {
+                serde_json::from_str(
+                    &redistribute_finalize(me, &deals_for(&deals, me), &pkp, new_t, &new_json)
+                        .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// **Adding a member** — the case upstream's `refresh` cannot do, and the
+    /// reason this code exists. The vault address is untouched, so the funds
+    /// never move, and the newcomer can sign.
+    #[test]
+    fn redistribution_can_add_a_member() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let new = run_redistribute(&[(1, &old[0]), (2, &old[1])], &old[0], &[1, 2, 3, 4], 2);
+
+        for (k, n) in new.iter().enumerate() {
+            assert_eq!(n.group_key, old[0].group_key, "participant {k}");
+        }
+        // The newcomer (id 4) held no share before and can sign now.
+        sign_and_verify(&[(3, &new[2]), (4, &new[3])]);
+    }
+
+    /// **Changing the threshold** — the other thing upstream refuses. 2-of-3
+    /// becomes 3-of-4 under the same group key.
+    #[test]
+    fn redistribution_can_change_the_threshold() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let new = run_redistribute(&[(1, &old[0]), (2, &old[1])], &old[0], &[1, 2, 3, 4], 3);
+
+        assert_eq!(new[0].group_key, old[0].group_key);
+        sign_and_verify(&[(1, &new[0]), (2, &new[1]), (4, &new[3])]);
+    }
+
+    /// **Replacing a device.** Member 3 lost theirs and returns as id 4. They
+    /// cannot help — and are not needed.
+    #[test]
+    fn redistribution_can_replace_a_lost_device() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let new = run_redistribute(&[(1, &old[0]), (2, &old[1])], &old[0], &[1, 2, 4], 2);
+
+        assert_eq!(new[0].group_key, old[0].group_key);
+        assert_eq!(new[2].group_key, old[0].group_key);
+        sign_and_verify(&[(1, &new[0]), (4, &new[2])]);
+    }
+
+    /// **Removing a member**, with only the survivors dealing.
+    #[test]
+    fn redistribution_can_remove_a_member() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let new = run_redistribute(&[(1, &old[0]), (2, &old[1])], &old[0], &[1, 2], 2);
+
+        assert_eq!(new[0].group_key, old[0].group_key);
+        sign_and_verify(&[(1, &new[0]), (2, &new[1])]);
+    }
+
+    /// Exactly `t` dealers is enough. Requiring more would mean a vault whose
+    /// own threshold cannot authorise a roster change.
+    #[test]
+    fn t_dealers_suffice() {
+        let old = run_dkg(&[1, 2, 3, 4, 5], 3);
+        let new = run_redistribute(
+            &[(1, &old[0]), (2, &old[1]), (3, &old[2])],
+            &old[0],
+            &[1, 2, 3, 4, 5, 6],
+            3,
+        );
+        assert_eq!(new[5].group_key, old[0].group_key);
+        sign_and_verify(&[(4, &new[3]), (5, &new[4]), (6, &new[5])]);
+    }
+
+    /// And below `t` it must fail. A sub-threshold group redistributing at will
+    /// would be a complete break: two of five could deal themselves a vault.
+    #[test]
+    fn sub_threshold_dealers_are_refused() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let deals = deals_from(&[(1, &old[0])], &[1, 2, 3], 2);
+
+        let err = redistribute_finalize(
+            1,
+            &deals_for(&deals, 1),
+            &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            2,
+            "[1,2,3]",
+        )
+        .expect_err("one dealer must not be able to redistribute a 2-of-3");
+        assert!(
+            err.contains("does not reconstruct the group key"),
+            "got: {err}"
+        );
+    }
+
+    /// A dealer re-splitting something other than its own share. The Feldman
+    /// check passes — the polynomial is internally consistent — so only the
+    /// binding to the old public key package catches this.
+    #[test]
+    fn a_dealer_resplitting_a_foreign_secret_is_refused() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let other = run_dkg(&[1, 2, 3], 2); // a different vault entirely
+
+        let deals = deals_from(&[(1, &old[0]), (2, &other[1])], &[1, 2, 3], 2);
+        let err = redistribute_finalize(
+            1,
+            &deals_for(&deals, 1),
+            &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            2,
+            "[1,2,3]",
+        )
+        .expect_err("a foreign secret must not be dealt into this vault");
+        assert!(err.contains("not its own share"), "got: {err}");
+    }
+
+    /// A dealer sending one recipient a share off its own committed curve.
+    /// This is the Feldman check doing its job.
+    #[test]
+    fn a_tampered_sub_share_is_refused() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let deals = deals_from(&[(1, &old[0]), (2, &old[1])], &[1, 2, 3], 2);
+
+        // Dealer 2 swaps in the share it meant for participant 3.
+        let mut mine: Packages<frost::keys::SecretShare> = deals
+            .iter()
+            .map(|d| (d.dealer, d.shares[&1].clone()))
+            .collect();
+        let wrong = deals[1].shares[&3].clone();
+        mine.insert(
+            2,
+            frost::keys::SecretShare::new(
+                ident(1).unwrap(),
+                *wrong.signing_share(),
+                wrong.commitment().clone(),
+            ),
+        );
+
+        let err = redistribute_finalize(
+            1,
+            &serde_json::to_string(&mine).unwrap(),
+            &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            2,
+            "[1,2,3]",
+        )
+        .expect_err("a share off the committed polynomial must be refused");
+        assert!(err.contains("invalid share"), "got: {err}");
+    }
+
+    /// A dealer quietly dealing at a lower threshold than everyone agreed to
+    /// would leave a vault that reconstructs below its stated `t`.
+    #[test]
+    fn a_deal_at_the_wrong_threshold_is_refused() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let honest = deals_from(&[(1, &old[0])], &[1, 2, 3], 3);
+        let cheat = deals_from(&[(2, &old[1])], &[1, 2, 3], 2);
+
+        let mine: Packages<frost::keys::SecretShare> = [
+            (honest[0].dealer, honest[0].shares[&1].clone()),
+            (cheat[0].dealer, cheat[0].shares[&1].clone()),
+        ]
+        .into_iter()
+        .collect();
+
+        let err = redistribute_finalize(
+            1,
+            &serde_json::to_string(&mine).unwrap(),
+            &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            3,
+            "[1,2,3]",
+        )
+        .expect_err("a lower-degree deal must be refused");
+        assert!(err.contains("wrong threshold"), "got: {err}");
+    }
+
+    /// Handing a participant a share addressed to somebody else.
+    #[test]
+    fn a_share_addressed_elsewhere_is_refused() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let deals = deals_from(&[(1, &old[0]), (2, &old[1])], &[1, 2, 3], 2);
+
+        let err = redistribute_finalize(
+            1,
+            &deals_for(&deals, 2), // participant 2's shares, handed to 1
+            &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            2,
+            "[1,2,3]",
+        )
+        .expect_err("a misaddressed share must be refused");
+        assert!(err.contains("addressed to someone else"), "got: {err}");
+    }
+
+    /// A roster with a repeated id would silently shrink `n` — the caller would
+    /// believe it built a 2-of-4 and have a 2-of-3.
+    #[test]
+    fn a_duplicated_roster_entry_is_refused() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let err = redistribute_deal(&kp(&old[0]), "[1,2,3,3]", 2, None)
+            .expect_err("a duplicate participant must be refused");
+        assert!(err.contains("duplicate participant"), "got: {err}");
+    }
+
+    /// Two recipients folding in DIFFERENT dealer sets land on different
+    /// polynomials. Both pass through the same secret at zero, so both report
+    /// the expected `group_key` — and they cannot sign with each other.
+    ///
+    /// This is the trap worth pinning: **the group-key check does not catch
+    /// it.** It is fail-closed (aggregation refuses) rather than a fund risk,
+    /// but the failure is remote from its cause, so the ceremony layer has to
+    /// pin the dealer set rather than let each recipient pick.
+    #[test]
+    fn divergent_dealer_sets_produce_incompatible_shares() {
+        let old = run_dkg(&[1, 2, 3, 4, 5], 3);
+        let new_ids = [1u16, 2, 3, 4, 5];
+        let roster = serde_json::to_string(&new_ids).unwrap();
+        let pkp = serde_json::to_string(&old[0].public_key_package).unwrap();
+
+        // All four deal; the two recipients disagree about whom to fold in.
+        let deals = deals_from(
+            &[(1, &old[0]), (2, &old[1]), (3, &old[2]), (4, &old[3])],
+            &new_ids,
+            3,
+        );
+        let subset = |me: u16, dealers: &[u16]| {
+            let m: Packages<frost::keys::SecretShare> = deals
+                .iter()
+                .filter(|d| dealers.contains(&d.dealer))
+                .map(|d| (d.dealer, d.shares[&me].clone()))
+                .collect();
+            serde_json::to_string(&m).unwrap()
+        };
+
+        let a: Finalized = serde_json::from_str(
+            &redistribute_finalize(1, &subset(1, &[1, 2, 3]), &pkp, 3, &roster).unwrap(),
+        )
+        .unwrap();
+        let b: Finalized = serde_json::from_str(
+            &redistribute_finalize(2, &subset(2, &[2, 3, 4]), &pkp, 3, &roster).unwrap(),
+        )
+        .unwrap();
+        let c: Finalized = serde_json::from_str(
+            &redistribute_finalize(3, &subset(3, &[2, 3, 4]), &pkp, 3, &roster).unwrap(),
+        )
+        .unwrap();
+
+        // Both succeeded, and both agree on the group key. That is precisely
+        // why this cannot be caught by checking it.
+        assert_eq!(a.group_key, old[0].group_key);
+        assert_eq!(b.group_key, old[0].group_key);
+
+        // But 1 is on a different polynomial from 2 and 3, so the quorum fails.
+        let signers = [(1u16, &a), (2u16, &b), (3u16, &c)];
+        let root = Some(String::new());
+        let (nonces, commitments) = commit(&signers);
+        let err = sign_aggregate(
+            &commitments,
+            &shares(&signers, &nonces, &commitments, root.clone()),
+            &serde_json::to_string(&b.public_key_package).unwrap(),
+            MSG,
+            root,
+        )
+        .expect_err("shares from divergent dealer sets must not aggregate");
+        assert!(err.contains("Invalid signature share"), "got: {err}");
+    }
+
+    /// Redistribution is not a one-shot: the result must itself be
+    /// redistributable, or a vault can only ever change hands once.
+    #[test]
+    fn redistribution_composes() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let once = run_redistribute(&[(1, &old[0]), (2, &old[1])], &old[0], &[1, 2, 3, 4], 3);
+        let twice = run_redistribute(
+            &[(1, &once[0]), (2, &once[1]), (4, &once[3])],
+            &once[0],
+            &[2, 4, 5],
+            2,
+        );
+
+        assert_eq!(twice[0].group_key, old[0].group_key);
+        sign_and_verify(&[(4, &twice[1]), (5, &twice[2])]);
     }
 
     #[test]
