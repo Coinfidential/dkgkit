@@ -336,12 +336,19 @@ fn roster(json: &str, what: &str) -> Result<Vec<Identifier>, String> {
 #[wasm_bindgen]
 pub fn redistribute_deal(
     old_key_package: &str,
+    expected_group_key: &str,
     new_participants: &str,
     new_threshold: u16,
     extra_entropy: Option<String>,
 ) -> Result<String, String> {
     let kp: frost::keys::KeyPackage = from_json(old_key_package, "old key package")?;
     let new_idents = roster(new_participants, "new roster")?;
+
+    // Deal only from the vault the caller means. A stale key package — one from
+    // before an earlier redistribution — would deal a share of the right secret
+    // on the wrong generation's polynomial, and the recipients' binding check
+    // would reject it far from the cause.
+    pinned(kp.verifying_key(), expected_group_key)?;
 
     if (new_threshold as usize) > new_idents.len() {
         return Err(format!(
@@ -369,6 +376,25 @@ pub fn redistribute_deal(
         dealer: unident(kp.identifier())?,
         shares: keyed(shares)?,
     })
+}
+
+/// Refuse any public input whose group key is not the one the caller expects.
+///
+/// Both public inputs to a redistribution — the old public key package and a
+/// dealer's own key package — are anchored on this. The group key is the single
+/// value a vault has already certified unanimously and every member knows, so
+/// pinning to it is what turns "a package I was handed" into "the package for
+/// MY vault". Without it, `redistribute_finalize` trusts its caller to have
+/// obtained the right one, which is exactly the trust this crate should not be
+/// asking for.
+fn pinned(actual: &frost::VerifyingKey, expected: &str) -> Result<(), String> {
+    let got = hex::encode(actual.serialize().map_err(|e| format!("group key: {e}"))?);
+    if !got.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "group key mismatch: this is not the vault you asked for (expected {expected}, got {got})"
+        ));
+    }
+    Ok(())
 }
 
 /// The verifying share every new member ends up with, derived from the dealers'
@@ -435,6 +461,11 @@ fn combine_deals(
 
     // (3) The dealer set must actually be authorised: below `t_old` dealers the
     // interpolation lands somewhere other than the group key.
+    //
+    // This covers the OUTPUT too, so there is nothing further to check there.
+    // Interpolating the new verifying shares gives Σ_j λ'_j·Y'_j = Σ_d λ_d·Φ_d(0),
+    // and (2) has already forced Φ_d(0) = Y_d — so it is this same sum. A second
+    // pass over the result would restate the check, not strengthen it.
     if anchor != old_pkp.verifying_key().to_element() {
         return Err(
             "redistribute: dealer set does not reconstruct the group key \
@@ -501,6 +532,7 @@ pub fn dkg_public_key_package(round1: &str) -> Result<String, String> {
 pub fn redistribute_public_key_package(
     commitments: &str,
     old_public_key_package: &str,
+    expected_group_key: &str,
     new_threshold: u16,
     new_participants: &str,
 ) -> Result<String, String> {
@@ -509,6 +541,8 @@ pub fn redistribute_public_key_package(
     let old_pkp: frost::keys::PublicKeyPackage =
         from_json(old_public_key_package, "old public keys")?;
     let new_idents = roster(new_participants, "new roster")?;
+
+    pinned(old_pkp.verifying_key(), expected_group_key)?;
 
     if new_threshold < 2 || (new_threshold as usize) > new_idents.len() {
         return Err(format!(
@@ -523,6 +557,7 @@ pub fn redistribute_public_key_package(
         .collect::<Result<_, String>>()?;
 
     let new_shares = combine_deals(&by_id, &old_pkp, &new_idents, new_threshold)?;
+
     let verifying_shares: BTreeMap<Identifier, frost::keys::VerifyingShare> = new_shares
         .into_iter()
         .map(|(j, e)| (j, frost::keys::VerifyingShare::new(e)))
@@ -541,20 +576,33 @@ pub fn redistribute_public_key_package(
 /// `deals` maps DEALER id → the [`frost::keys::SecretShare`] that dealer
 /// addressed to `participant`.
 ///
-/// Three things are checked, and all three matter:
+/// Nothing here is taken on trust. Five checks, each catching something none
+/// of the others do:
 ///
+/// 0. **Vault pin** — the old public key package is for the vault named by
+///    `expected_group_key`. First, because every check below is stated relative
+///    to that package; unpinned, a caller could supply a different vault's and
+///    have all of them pass against it.
 /// 1. **Feldman/VSS** — each sub-share lies on the polynomial its dealer
 ///    committed to. Catches a dealer sending one recipient a share off its own
 ///    curve.
 /// 2. **Dealer binding** — each dealer's commitment constant term equals that
-///    dealer's verifying share in the OLD public key package. Without this a
-///    dealer could re-split *some other* secret and silently move the group
-///    key; the Feldman check alone would not notice, because that polynomial is
-///    internally consistent.
-/// 3. **Group-key invariant** — the dealer set's old verifying shares
+///    dealer's verifying share in the old package. Without this a dealer could
+///    re-split *some other* secret and silently move the group key; Feldman
+///    alone would not notice, because that polynomial is internally consistent.
+/// 3. **Threshold** — each commitment has exactly `new_threshold` coefficients,
+///    so no dealer can quietly deal a lower-degree polynomial and leave a vault
+///    that reconstructs below its stated `t`.
+/// 4. **Group-key invariant** — the dealer set's old verifying shares
 ///    interpolate to the old verifying key. This is what proves the dealer set
 ///    is authorised: with fewer than `t_old` dealers the interpolation lands
 ///    somewhere else, so a sub-threshold group cannot redistribute.
+///
+/// The result is checked too, though only against arithmetic error: the share
+/// summed from the sub-shares must equal the verifying share derived
+/// independently from the commitments. Interpolating the new shares back to the
+/// group key would add nothing — check (4) already is that sum, see its
+/// comment.
 ///
 /// # Every recipient must combine the SAME dealer set
 ///
@@ -577,6 +625,7 @@ pub fn redistribute_finalize(
     participant: u16,
     deals: &str,
     old_public_key_package: &str,
+    expected_group_key: &str,
     new_threshold: u16,
     new_participants: &str,
 ) -> Result<String, String> {
@@ -585,6 +634,15 @@ pub fn redistribute_finalize(
     let old_pkp: frost::keys::PublicKeyPackage =
         from_json(old_public_key_package, "old public keys")?;
     let new_idents = roster(new_participants, "new roster")?;
+
+    // Before anything else. Every later check is stated relative to this
+    // package — dealer binding reads its verifying shares, the dealer-set
+    // invariant reads its verifying key — so an unpinned package would let a
+    // caller move the goalposts and have all of them pass against the wrong
+    // vault. A member being ADDED can derive this package for themselves with
+    // `dkg_public_key_package` / `redistribute_public_key_package` and needs to
+    // trust nobody for it.
+    pinned(old_pkp.verifying_key(), expected_group_key)?;
 
     if received.is_empty() {
         return Err("redistribute: no deals".into());
@@ -636,8 +694,8 @@ pub fn redistribute_finalize(
         share += lambda * deal.signing_share().to_scalar();
     }
 
-    // Belt and braces: the share we just built must match the verifying share
-    // derived independently from the commitments.
+    // The secret share we summed must match the verifying share derived
+    // independently from the commitments — two routes to the same point.
     if new_shares[&me] != generator() * share {
         return Err("redistribute: derived share disagrees with its commitment".into());
     }
@@ -1032,8 +1090,10 @@ mod tests {
         dealers
             .iter()
             .map(|(_, k)| {
-                serde_json::from_str(&redistribute_deal(&kp(k), &new_json, new_t, None).unwrap())
-                    .unwrap()
+                serde_json::from_str(
+                    &redistribute_deal(&kp(k), &k.group_key, &new_json, new_t, None).unwrap(),
+                )
+                .unwrap()
             })
             .collect()
     }
@@ -1058,12 +1118,13 @@ mod tests {
         let deals = deals_from(dealers, new_ids, new_t);
         let new_json = serde_json::to_string(new_ids).unwrap();
         let pkp = serde_json::to_string(&old_pkp.public_key_package).unwrap();
+        let gk = &old_pkp.group_key;
 
         new_ids
             .iter()
             .map(|&me| {
                 serde_json::from_str(
-                    &redistribute_finalize(me, &deals_for(&deals, me), &pkp, new_t, &new_json)
+                    &redistribute_finalize(me, &deals_for(&deals, me), &pkp, gk, new_t, &new_json)
                         .unwrap(),
                 )
                 .unwrap()
@@ -1145,6 +1206,7 @@ mod tests {
             1,
             &deals_for(&deals, 1),
             &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            &old[0].group_key,
             2,
             "[1,2,3]",
         )
@@ -1168,6 +1230,7 @@ mod tests {
             1,
             &deals_for(&deals, 1),
             &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            &old[0].group_key,
             2,
             "[1,2,3]",
         )
@@ -1201,6 +1264,7 @@ mod tests {
             1,
             &serde_json::to_string(&mine).unwrap(),
             &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            &old[0].group_key,
             2,
             "[1,2,3]",
         )
@@ -1227,6 +1291,7 @@ mod tests {
             1,
             &serde_json::to_string(&mine).unwrap(),
             &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            &old[0].group_key,
             3,
             "[1,2,3]",
         )
@@ -1244,6 +1309,7 @@ mod tests {
             1,
             &deals_for(&deals, 2), // participant 2's shares, handed to 1
             &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            &old[0].group_key,
             2,
             "[1,2,3]",
         )
@@ -1256,7 +1322,7 @@ mod tests {
     #[test]
     fn a_duplicated_roster_entry_is_refused() {
         let old = run_dkg(&[1, 2, 3], 2);
-        let err = redistribute_deal(&kp(&old[0]), "[1,2,3,3]", 2, None)
+        let err = redistribute_deal(&kp(&old[0]), &old[0].group_key, "[1,2,3,3]", 2, None)
             .expect_err("a duplicate participant must be refused");
         assert!(err.contains("duplicate participant"), "got: {err}");
     }
@@ -1300,7 +1366,15 @@ mod tests {
             .iter()
             .map(|&me| {
                 serde_json::from_str(
-                    &redistribute_finalize(me, &deals_for(&deals, me), &pkp, 3, &roster).unwrap(),
+                    &redistribute_finalize(
+                        me,
+                        &deals_for(&deals, me),
+                        &pkp,
+                        &old[0].group_key,
+                        3,
+                        &roster,
+                    )
+                    .unwrap(),
                 )
                 .unwrap()
             })
@@ -1317,6 +1391,7 @@ mod tests {
             &redistribute_public_key_package(
                 &serde_json::to_string(&commitments).unwrap(),
                 &serde_json::to_string(&old[0].public_key_package).unwrap(),
+                &old[0].group_key,
                 3,
                 &serde_json::to_string(&new_ids).unwrap(),
             )
@@ -1346,6 +1421,7 @@ mod tests {
         let err = redistribute_public_key_package(
             &serde_json::to_string(&commitments).unwrap(),
             &serde_json::to_string(&old[0].public_key_package).unwrap(),
+            &old[0].group_key,
             2,
             "[1,2,3]",
         )
@@ -1354,6 +1430,43 @@ mod tests {
             err.contains("does not reconstruct the group key"),
             "got: {err}"
         );
+    }
+
+    /// The old public key package is an INPUT, and every other check is stated
+    /// relative to it — dealer binding reads its verifying shares, the
+    /// dealer-set invariant reads its verifying key. Unpinned, a caller could
+    /// move the goalposts and have all of them pass against the wrong vault.
+    #[test]
+    fn finalize_refuses_a_package_from_another_vault() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let other = run_dkg(&[1, 2, 3], 2);
+        let deals = deals_from(&[(1, &old[0]), (2, &old[1])], &[1, 2, 3], 2);
+
+        let err = redistribute_finalize(
+            1,
+            &deals_for(&deals, 1),
+            // A perfectly well-formed package — for a different vault.
+            &serde_json::to_string(&other[0].public_key_package).unwrap(),
+            &old[0].group_key,
+            2,
+            "[1,2,3]",
+        )
+        .expect_err("a package for another vault must be refused");
+        assert!(err.contains("not the vault you asked for"), "got: {err}");
+    }
+
+    /// And the dealer's own key package is pinned too. A stale one — from
+    /// before an earlier redistribution — deals the right secret on the wrong
+    /// generation's polynomial, which recipients would reject far from the
+    /// cause.
+    #[test]
+    fn dealing_from_the_wrong_vault_is_refused() {
+        let old = run_dkg(&[1, 2, 3], 2);
+        let other = run_dkg(&[1, 2, 3], 2);
+
+        let err = redistribute_deal(&kp(&other[0]), &old[0].group_key, "[1,2,3]", 2, None)
+            .expect_err("dealing from another vault's share must be refused");
+        assert!(err.contains("not the vault you asked for"), "got: {err}");
     }
 
     /// Two recipients folding in DIFFERENT dealer sets land on different
@@ -1387,15 +1500,39 @@ mod tests {
         };
 
         let a: Finalized = serde_json::from_str(
-            &redistribute_finalize(1, &subset(1, &[1, 2, 3]), &pkp, 3, &roster).unwrap(),
+            &redistribute_finalize(
+                1,
+                &subset(1, &[1, 2, 3]),
+                &pkp,
+                &old[0].group_key,
+                3,
+                &roster,
+            )
+            .unwrap(),
         )
         .unwrap();
         let b: Finalized = serde_json::from_str(
-            &redistribute_finalize(2, &subset(2, &[2, 3, 4]), &pkp, 3, &roster).unwrap(),
+            &redistribute_finalize(
+                2,
+                &subset(2, &[2, 3, 4]),
+                &pkp,
+                &old[0].group_key,
+                3,
+                &roster,
+            )
+            .unwrap(),
         )
         .unwrap();
         let c: Finalized = serde_json::from_str(
-            &redistribute_finalize(3, &subset(3, &[2, 3, 4]), &pkp, 3, &roster).unwrap(),
+            &redistribute_finalize(
+                3,
+                &subset(3, &[2, 3, 4]),
+                &pkp,
+                &old[0].group_key,
+                3,
+                &roster,
+            )
+            .unwrap(),
         )
         .unwrap();
 
