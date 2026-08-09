@@ -20,12 +20,22 @@ set -e
 staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
 [ -z "$staged" ] && exit 0
 
-command -v cargo >/dev/null 2>&1 || {
-	echo "pre-commit: cargo not on PATH, skipping rustfmt" >&2
-	exit 0
-}
+# Git hooks do not inherit an interactive shell's PATH, and rustup installs to
+# ~/.cargo/bin — which is on PATH in a terminal and frequently not here. Found
+# that the hard way: the hook reported "skipping" on a real commit and did
+# nothing, which is worse than no hook, because you stop checking.
+if command -v cargo >/dev/null 2>&1; then
+	CARGO=cargo
+elif [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]; then
+	CARGO="${CARGO_HOME:-$HOME/.cargo}/bin/cargo"
+else
+	echo "pre-commit: cannot find cargo — Rust is NOT formatted for this commit." >&2
+	echo "            CI runs 'cargo fmt --check' and will fail. Run it yourself," >&2
+	echo "            or put cargo on PATH and amend." >&2
+	exit 1
+fi
 
-cargo fmt
+"$CARGO" fmt
 
 # Re-stage only what was staged to begin with, and only if it still exists.
 for f in $staged; do
