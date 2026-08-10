@@ -24,6 +24,15 @@ crate-type = ["cdylib", "rlib"]
 # Count the code you must trust, not the entries in Cargo.lock.
 [dependencies]
 frost-secp256k1-tr = { version = "3", default-features = false, features = ["serde"] }
+# The same frost-core that frost-secp256k1-tr already pulls in, with its
+# `internals` feature turned on. `internals = []` is an empty feature on a crate
+# already in the tree, so this adds no new code to trust — it only makes
+# already-present, already-reviewed code callable:
+# `compute_lagrange_coefficient`, `VerifyingShare::from_commitment` (VSS
+# evaluation) and scalar/element accessors. Redistribution needs all three, and
+# the alternative is writing them here, which is what this crate exists to
+# avoid. Verified: zero additional entries in Cargo.lock.
+frost-core = { version = "3", default-features = false, features = ["internals"] }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

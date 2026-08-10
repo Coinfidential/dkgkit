@@ -26,6 +26,24 @@ The body is where the value is. Say why, and say what a reviewer would
 otherwise have to rediscover — a rejected alternative, a bug the change fixes,
 an upstream assumption now being relied on.
 
+## Formatting is automatic
+
+Enable the repo's hooks once per clone:
+
+```
+git config core.hooksPath .githooks
+```
+
+`pre-commit` then runs `cargo fmt` and re-stages the Rust files you had already
+staged. `cargo fmt --check` is the first thing CI runs, and a red build over
+whitespace tells you nothing you wanted to know.
+
+It re-stages only what was staged to begin with — if the formatter also touches
+something you deliberately left out, that stays unstaged. `--no-verify` skips it.
+
+Note `cargo fmt` only formats files reachable from the crate root, so a new
+module is formatted once it is declared, not before.
+
 ## Before pushing
 
 CI runs exactly these, and no more:
@@ -46,9 +64,17 @@ passed against a broken wasm build.
 
 This crate marshals JSON across the wasm boundary and delegates every
 cryptographic operation to `frost-secp256k1-tr`. It derives no challenges, sums
-no nonces and touches no scalars.
+no nonces, evaluates no polynomial and implements no field arithmetic.
 
-Patches adding hand-written cryptography, or hand-written parsers for
-cryptographic input, will be turned down. The hex decoder this repo shipped
-briefly is the cautionary example: `u8::from_str_radix` accepts a sign, so
-`"+f"` parsed as a byte.
+**One deliberate exception**, in `redistribute_finalize`: combining a set of
+dealers' contributions means weighting scalars and group elements by Lagrange
+coefficients, and no upstream function does that for a roster that changes.
+Every piece of it still comes from `frost-core`'s `internals` surface —
+`compute_lagrange_coefficient`, VSS evaluation via
+`VerifyingShare::from_commitment`, and the `Field`/`Group` traits. What this
+crate contributes is the summation, not the arithmetic.
+
+That exception is the boundary, not an opening. Patches adding hand-written
+cryptography, or hand-written parsers for cryptographic input, will be turned
+down. The hex decoder this repo shipped briefly is the cautionary example:
+`u8::from_str_radix` accepts a sign, so `"+f"` parsed as a byte.
