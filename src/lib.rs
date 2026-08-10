@@ -1804,4 +1804,594 @@ mod tests {
         .expect_err("threshold change must be refused");
         assert!(err.to_lowercase().contains("min"), "got: {err}");
     }
+
+    // ── Language-neutral test vectors ───────────────────────────────────────
+    //
+    // `vectors/redistribute.json` states what a redistribution must produce,
+    // in hex and plain integers, so an implementation in another language can
+    // be checked against it without reading any Rust. See `vectors/README.md`
+    // for the format and the argument for why the vectors pin
+    // `redistribute_finalize` rather than `redistribute_deal`.
+
+    fn vectors_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors/redistribute.json")
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Vectors {
+        version: u32,
+        ciphersuite: String,
+        note: String,
+        valid: Vec<ValidCase>,
+        invalid: Vec<InvalidCase>,
+    }
+
+    /// The vault as it stood before the redistribution. Everything here is
+    /// public: it is exactly `redistribute_finalize`'s `old_public_key_package`
+    /// argument, spelled out field by field.
+    #[derive(Serialize, Deserialize)]
+    struct OldVault {
+        threshold: u16,
+        participants: Vec<u16>,
+        group_key: String,
+        verifying_shares: BTreeMap<u16, String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct NewRoster {
+        threshold: u16,
+        participants: Vec<u16>,
+    }
+
+    /// One dealer's contribution. `commitment` is public and identical in every
+    /// copy of this deal; each entry in `shares` is secret to its recipient.
+    #[derive(Clone, Serialize, Deserialize)]
+    struct DealVec {
+        commitment: Vec<String>,
+        shares: BTreeMap<u16, String>,
+    }
+
+    /// Working shown, so an implementer can find where they diverged instead of
+    /// only learning that they did. Per dealer: the Lagrange coefficient λ_d
+    /// over the dealer set, and Φ_d(j) — that dealer's commitment evaluated at
+    /// each new participant, before λ weighting and before summation.
+    #[derive(Serialize, Deserialize)]
+    struct Intermediate {
+        lagrange: String,
+        commitment_evaluations: BTreeMap<u16, String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Expected {
+        group_key: String,
+        verifying_shares: BTreeMap<u16, String>,
+        signing_shares: BTreeMap<u16, String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct ValidCase {
+        name: String,
+        description: String,
+        old: OldVault,
+        dealers: Vec<u16>,
+        new: NewRoster,
+        deals: BTreeMap<u16, DealVec>,
+        intermediates: BTreeMap<u16, Intermediate>,
+        expected: Expected,
+    }
+
+    /// A case that must be REFUSED. `participant` finalises, pinning
+    /// `expected_group_key`, and the implementation must fail with a message
+    /// covering `error_contains` — the substring is the contract, not the
+    /// wording around it.
+    #[derive(Serialize, Deserialize)]
+    struct InvalidCase {
+        name: String,
+        description: String,
+        old: OldVault,
+        dealers: Vec<u16>,
+        new: NewRoster,
+        deals: BTreeMap<u16, DealVec>,
+        participant: u16,
+        expected_group_key: String,
+        error_contains: String,
+    }
+
+    fn vss(hexes: &[String]) -> frost::keys::VerifiableSecretSharingCommitment {
+        let raw: Vec<Vec<u8>> = hexes.iter().map(|h| unhex(h).unwrap()).collect();
+        frost::keys::VerifiableSecretSharingCommitment::deserialize(raw).unwrap()
+    }
+
+    /// The deals addressed to `me`, in the JSON `redistribute_finalize` reads.
+    /// This is the one step a reimplementation has to mirror: a vector's deal is
+    /// a commitment plus one scalar per recipient, and each recipient assembles
+    /// the sub-shares addressed to it.
+    fn deals_json_for(deals: &BTreeMap<u16, DealVec>, me: u16) -> String {
+        let mine: Packages<frost::keys::SecretShare> = deals
+            .iter()
+            .filter(|(_, d)| d.shares.contains_key(&me))
+            .map(|(&dealer, d)| {
+                let share = frost::keys::SigningShare::deserialize(&unhex(&d.shares[&me]).unwrap())
+                    .unwrap();
+                (
+                    dealer,
+                    frost::keys::SecretShare::new(ident(me).unwrap(), share, vss(&d.commitment)),
+                )
+            })
+            .collect();
+        serde_json::to_string(&mine).unwrap()
+    }
+
+    /// The old public key package, rebuilt from the vector's public fields
+    /// alone — nothing is carried over from the run that produced them.
+    fn old_pkp_json(old: &OldVault) -> String {
+        let shares: BTreeMap<Identifier, frost::keys::VerifyingShare> = old
+            .verifying_shares
+            .iter()
+            .map(|(&i, h)| {
+                (
+                    ident(i).unwrap(),
+                    frost::keys::VerifyingShare::deserialize(&unhex(h).unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        let vk = frost::VerifyingKey::deserialize(&unhex(&old.group_key).unwrap()).unwrap();
+        serde_json::to_string(&frost::keys::PublicKeyPackage::new(
+            shares,
+            vk,
+            Some(old.threshold),
+        ))
+        .unwrap()
+    }
+
+    /// **The vectors are the specification.** Every valid case is replayed from
+    /// the file's bytes — not from a fresh run — and must land on exactly the
+    /// shares recorded there; every invalid case must be refused.
+    ///
+    /// A reimplementation in another language passes this file if it does the
+    /// same, which is the whole point of shipping it.
+    #[test]
+    fn the_vectors_reproduce_byte_for_byte() {
+        let raw = std::fs::read_to_string(vectors_path())
+            .expect("vectors/redistribute.json is missing — regenerate with `generate_vectors`");
+        let v: Vectors = serde_json::from_str(&raw).expect("vector file is malformed");
+
+        assert_eq!(v.version, 1, "unknown vector format version");
+        assert!(!v.valid.is_empty(), "no valid cases");
+        assert!(!v.invalid.is_empty(), "no invalid cases");
+
+        for case in &v.valid {
+            let pkp = old_pkp_json(&case.old);
+            let roster = serde_json::to_string(&case.new.participants).unwrap();
+
+            // Every member of the new roster finalises independently, which is
+            // also what proves they agree with each other about the public half.
+            for &me in &case.new.participants {
+                let out: Finalized = serde_json::from_str(
+                    &redistribute_finalize(
+                        me,
+                        &deals_json_for(&case.deals, me),
+                        &pkp,
+                        &case.old.group_key,
+                        case.new.threshold,
+                        &roster,
+                    )
+                    .unwrap_or_else(|e| panic!("{}: participant {me}: {e}", case.name)),
+                )
+                .unwrap();
+
+                assert_eq!(
+                    out.group_key, case.expected.group_key,
+                    "{}: participant {me} landed on a different group key",
+                    case.name
+                );
+                // The invariant the whole feature exists for: the address does
+                // not move, so the funds do not have to.
+                assert_eq!(
+                    out.group_key, case.old.group_key,
+                    "{}: the group key is not the one the vault started with",
+                    case.name
+                );
+
+                let signing = hex::encode(out.key_package.signing_share().serialize());
+                assert_eq!(
+                    signing, case.expected.signing_shares[&me],
+                    "{}: participant {me} derived a different signing share",
+                    case.name
+                );
+
+                for (&j, want) in &case.expected.verifying_shares {
+                    let got = hex::encode(
+                        out.public_key_package.verifying_shares()[&ident(j).unwrap()]
+                            .serialize()
+                            .unwrap(),
+                    );
+                    assert_eq!(
+                        &got, want,
+                        "{}: participant {me} disagrees about {j}'s verifying share",
+                        case.name
+                    );
+                }
+            }
+        }
+
+        for case in &v.invalid {
+            let roster = serde_json::to_string(&case.new.participants).unwrap();
+            let err = redistribute_finalize(
+                case.participant,
+                &deals_json_for(&case.deals, case.participant),
+                &old_pkp_json(&case.old),
+                &case.expected_group_key,
+                case.new.threshold,
+                &roster,
+            )
+            .expect_err(&format!("{}: must be refused", case.name));
+
+            assert!(
+                err.contains(&case.error_contains),
+                "{}: expected an error mentioning {:?}, got: {err}",
+                case.name,
+                case.error_contains
+            );
+        }
+    }
+
+    /// Regenerates `vectors/redistribute.json`. Ignored by default: the vectors
+    /// are a frozen artefact other implementations are checked against, so
+    /// rewriting them on every `cargo test` would defeat their purpose.
+    ///
+    /// ```text
+    /// cargo test generate_vectors -- --ignored
+    /// ```
+    ///
+    /// Dealing draws fresh OS entropy every time, so a regenerated file differs
+    /// from the old one everywhere. Regenerate only when the FORMAT changes, and
+    /// review the diff as a new artefact rather than as an edit.
+    #[test]
+    #[ignore = "rewrites the frozen vector file; run deliberately"]
+    fn generate_vectors() {
+        fn deal_vec(d: &Deal) -> DealVec {
+            let any = d.shares.values().next().expect("a deal with no recipients");
+            DealVec {
+                commitment: any
+                    .commitment()
+                    .serialize()
+                    .unwrap()
+                    .iter()
+                    .map(hex::encode)
+                    .collect(),
+                shares: d
+                    .shares
+                    .iter()
+                    .map(|(&j, s)| (j, hex::encode(s.signing_share().serialize())))
+                    .collect(),
+            }
+        }
+
+        fn old_vault(f: &Finalized, threshold: u16) -> OldVault {
+            let vs = f.public_key_package.verifying_shares();
+            OldVault {
+                threshold,
+                participants: vs.keys().map(|i| unident(i).unwrap()).collect(),
+                group_key: f.group_key.clone(),
+                verifying_shares: vs
+                    .iter()
+                    .map(|(i, s)| (unident(i).unwrap(), hex::encode(s.serialize().unwrap())))
+                    .collect(),
+            }
+        }
+
+        /// λ_d and Φ_d(j) for each dealer, from the public commitments alone.
+        fn intermediates(deals: &[Deal], new_ids: &[u16]) -> BTreeMap<u16, Intermediate> {
+            let dealers: BTreeSet<Identifier> =
+                deals.iter().map(|d| ident(d.dealer).unwrap()).collect();
+            deals
+                .iter()
+                .map(|d| {
+                    let me = ident(d.dealer).unwrap();
+                    let commitment = d.shares.values().next().unwrap().commitment();
+                    let lambda = compute_lagrange_coefficient(&dealers, None, me).unwrap();
+                    (
+                        d.dealer,
+                        Intermediate {
+                            lagrange: hex::encode(
+                                frost::keys::SigningShare::new(lambda).serialize(),
+                            ),
+                            commitment_evaluations: new_ids
+                                .iter()
+                                .map(|&j| {
+                                    let phi = frost::keys::VerifyingShare::from_commitment(
+                                        ident(j).unwrap(),
+                                        commitment,
+                                    );
+                                    (j, hex::encode(phi.serialize().unwrap()))
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        fn valid_case(
+            name: &str,
+            description: &str,
+            old: &[Finalized],
+            old_t: u16,
+            dealers: &[u16],
+            new_ids: &[u16],
+            new_t: u16,
+        ) -> ValidCase {
+            let picked: Vec<(u16, &Finalized)> = dealers
+                .iter()
+                .map(|&d| {
+                    let k = old
+                        .iter()
+                        .find(|f| unident(f.key_package.identifier()).unwrap() == d)
+                        .expect("dealer is not in the old roster");
+                    (d, k)
+                })
+                .collect();
+
+            let deals = deals_from(&picked, new_ids, new_t);
+            let new_json = serde_json::to_string(new_ids).unwrap();
+            let pkp = serde_json::to_string(&old[0].public_key_package).unwrap();
+
+            let finalized: Vec<Finalized> = new_ids
+                .iter()
+                .map(|&me| {
+                    serde_json::from_str(
+                        &redistribute_finalize(
+                            me,
+                            &deals_for(&deals, me),
+                            &pkp,
+                            &old[0].group_key,
+                            new_t,
+                            &new_json,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+
+            ValidCase {
+                name: name.into(),
+                description: description.into(),
+                old: old_vault(&old[0], old_t),
+                dealers: dealers.to_vec(),
+                new: NewRoster {
+                    threshold: new_t,
+                    participants: new_ids.to_vec(),
+                },
+                deals: deals.iter().map(|d| (d.dealer, deal_vec(d))).collect(),
+                intermediates: intermediates(&deals, new_ids),
+                expected: Expected {
+                    group_key: finalized[0].group_key.clone(),
+                    verifying_shares: finalized[0]
+                        .public_key_package
+                        .verifying_shares()
+                        .iter()
+                        .map(|(i, s)| (unident(i).unwrap(), hex::encode(s.serialize().unwrap())))
+                        .collect(),
+                    signing_shares: new_ids
+                        .iter()
+                        .zip(&finalized)
+                        .map(|(&i, f)| (i, hex::encode(f.key_package.signing_share().serialize())))
+                        .collect(),
+                },
+            }
+        }
+
+        let old = run_dkg(&[1, 2, 3], 2);
+        let elsewhere = run_dkg(&[1, 2, 3], 2);
+
+        let valid = vec![
+            valid_case(
+                "add-a-member",
+                "2-of-3 becomes 2-of-4. Participant 4 held no share before and \
+                 supplies nothing here; it is a recipient only. This is the case \
+                 upstream's `keys::refresh` cannot do.",
+                &old,
+                2,
+                &[1, 2],
+                &[1, 2, 3, 4],
+                2,
+            ),
+            valid_case(
+                "remove-a-member",
+                "2-of-3 becomes 2-of-2. Participant 3 does not deal and does not \
+                 have to consent — the point of the recovery path.",
+                &old,
+                2,
+                &[1, 2],
+                &[1, 2],
+                2,
+            ),
+            valid_case(
+                "replace-a-device",
+                "Participant 3 lost their device and returns as participant 4. \
+                 They cannot help, and are not needed.",
+                &old,
+                2,
+                &[1, 2],
+                &[1, 2, 4],
+                2,
+            ),
+            valid_case(
+                "change-the-threshold",
+                "2-of-3 becomes 3-of-4 under the same group key. The other thing \
+                 upstream's refresh refuses.",
+                &old,
+                2,
+                &[1, 2],
+                &[1, 2, 3, 4],
+                3,
+            ),
+        ];
+
+        // ── The refusals ────────────────────────────────────────────────────
+        //
+        // Each is derived from `add-a-member` by breaking exactly one thing, so
+        // the difference between a case that passes and one that must not is
+        // legible in the file.
+        let base = &valid[0];
+
+        let invalid_case = |name: &str,
+                            description: &str,
+                            old: OldVault,
+                            dealers: Vec<u16>,
+                            new: NewRoster,
+                            deals: BTreeMap<u16, DealVec>,
+                            participant: u16,
+                            expected_group_key: String,
+                            error_contains: &str| InvalidCase {
+            name: name.into(),
+            description: description.into(),
+            old,
+            dealers,
+            new,
+            deals,
+            participant,
+            expected_group_key,
+            error_contains: error_contains.into(),
+        };
+
+        // (1) Feldman. Dealer 1's sub-share for participant 4 is swapped for the
+        //     one addressed to participant 3: a real point on the real
+        //     polynomial, at the wrong x.
+        let mut tampered = base.deals.clone();
+        let stolen = tampered[&1].shares[&3].clone();
+        tampered.get_mut(&1).unwrap().shares.insert(4, stolen);
+
+        // (2) A dealer re-splitting a secret that is not its own share. The
+        //     polynomial is perfectly self-consistent, so Feldman passes and
+        //     only the binding check catches it.
+        let foreign = deals_from(&[(1, &elsewhere[0])], &[1, 2, 3, 4], 2);
+        let mut foreign_deals = base.deals.clone();
+        foreign_deals.insert(1, deal_vec(&foreign[0]));
+
+        // (3) One dealer for a 2-of-3: below threshold, so the interpolation
+        //     lands somewhere other than the group key.
+        let mut lone = BTreeMap::new();
+        lone.insert(1, base.deals[&1].clone());
+
+        // (6) Deals cut at degree 1 (t=2) finalised as if t=3.
+        let invalid = vec![
+            invalid_case(
+                "feldman-verification-fails",
+                "Dealer 1's sub-share for participant 4 is the one addressed to \
+                 participant 3 — on the polynomial, at the wrong point.",
+                old_vault(&old[0], 2),
+                vec![1, 2],
+                NewRoster {
+                    threshold: 2,
+                    participants: vec![1, 2, 3, 4],
+                },
+                tampered,
+                4,
+                old[0].group_key.clone(),
+                "invalid share",
+            ),
+            invalid_case(
+                "dealer-resplits-a-foreign-secret",
+                "Dealer 1 deals a fresh, internally consistent split of a share \
+                 from a DIFFERENT vault. Feldman passes; the commitment's \
+                 constant term is not dealer 1's certified verifying share.",
+                old_vault(&old[0], 2),
+                vec![1, 2],
+                NewRoster {
+                    threshold: 2,
+                    participants: vec![1, 2, 3, 4],
+                },
+                foreign_deals,
+                4,
+                old[0].group_key.clone(),
+                "not its own share",
+            ),
+            invalid_case(
+                "sub-threshold-dealer-set",
+                "One dealer for a 2-of-3 vault. Every individual check passes; \
+                 the dealer set simply does not reconstruct the group key.",
+                old_vault(&old[0], 2),
+                vec![1],
+                NewRoster {
+                    threshold: 2,
+                    participants: vec![1, 2, 3, 4],
+                },
+                lone,
+                4,
+                old[0].group_key.clone(),
+                "does not reconstruct the group key",
+            ),
+            invalid_case(
+                "duplicate-participant-in-the-new-roster",
+                "A repeated id would be silently deduplicated and quietly change \
+                 the effective n.",
+                old_vault(&old[0], 2),
+                vec![1, 2],
+                NewRoster {
+                    threshold: 2,
+                    participants: vec![1, 2, 3, 3],
+                },
+                base.deals.clone(),
+                3,
+                old[0].group_key.clone(),
+                "duplicate participant",
+            ),
+            invalid_case(
+                "deals-at-the-wrong-threshold",
+                "Deals cut for a 2-of-n polynomial, finalised as if the new \
+                 threshold were 3. A shorter commitment means a vault that \
+                 reconstructs below the threshold everyone agreed to.",
+                old_vault(&old[0], 2),
+                vec![1, 2],
+                NewRoster {
+                    threshold: 3,
+                    participants: vec![1, 2, 3, 4],
+                },
+                base.deals.clone(),
+                4,
+                old[0].group_key.clone(),
+                "wrong threshold",
+            ),
+            invalid_case(
+                "pinned-to-another-vault",
+                "The old public key package is well formed and internally \
+                 consistent — it is just not the vault the finaliser asked for. \
+                 Checked before anything else, so no later check can pass \
+                 against the wrong vault.",
+                old_vault(&old[0], 2),
+                vec![1, 2],
+                NewRoster {
+                    threshold: 2,
+                    participants: vec![1, 2, 3, 4],
+                },
+                base.deals.clone(),
+                4,
+                elsewhere[0].group_key.clone(),
+                "not the vault you asked for",
+            ),
+        ];
+
+        let vectors = Vectors {
+            version: 1,
+            ciphersuite: "FROST(secp256k1, SHA-256) — BIP-340/341 taproot variant, RFC 9591".into(),
+            note: "Generated by `cargo test generate_vectors -- --ignored` in \
+                   Coinfidential/dkgkit. See vectors/README.md for the format and \
+                   for how to check an independent implementation against this file."
+                .into(),
+            valid,
+            invalid,
+        };
+
+        let path = vectors_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&vectors).unwrap() + "\n",
+        )
+        .unwrap();
+        println!("wrote {}", path.display());
+    }
 }
