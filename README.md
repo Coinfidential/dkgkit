@@ -1,12 +1,25 @@
 # dkgkit
 
-Threshold cryptography for Bitcoin — FROST distributed key generation,
-resharing and signing; MuSig2 transaction-tree cosigning; BIP-352 silent
-payments. Rust core compiled to WebAssembly, with a TypeScript API over it.
+FROST threshold key generation, resharing and signing for Bitcoin. A Rust
+crate, compiled to WebAssembly for hosts that want it.
 
-> **Status: key generation, signing and resharing work.** BIP-352 and the
-> MuSig2 tree paths are documented targets, not code. Nothing is published to a
-> registry.
+> **Status: key generation, signing and resharing work.** Nothing is published
+> to a registry.
+
+## Scope
+
+**Everything that touches a share, and nothing else.**
+
+That is the whole rule, and it is meant to be applied literally. Silent
+payments, taproot construction, transaction serialisation and address encoding
+are all *absent by design* — none of them touch a share, so none of them belong
+here. They are Bitcoin format and protocol work, they carry a different risk
+profile, and they want different reviewers.
+
+An earlier version of this README described a TypeScript half living alongside
+the crate. There isn't one. The only JavaScript dkgkit emits is wasm-bindgen's
+generated glue in `pkg/`; each host writes its own thin wrapper over it, which
+is a dozen lines and lets the host own its own loading and error handling.
 
 ## What exists today
 
@@ -90,37 +103,42 @@ participants reach each other. FROST participants are identified by
 `participantId: number` — not by a public key from any particular identity
 system. Whatever carries the ceremony messages is somebody else's problem.
 
-**Dual-runtime from one build.** `initFrost(wasmBytes?)` takes optional bytes:
-a browser omits them and lets the module fetch, a server runtime passes
-`readFileSync(path)`. One `wasm-pack --target web` build serves both, so the
-same code runs in a webview and under Node/Bun without a second target.
+**One build, and the host supplies the bytes.** `wasm-pack --target web` serves
+every host, but initialise with `initSync` and hand it the module bytes
+yourself. wasm-bindgen's default async export — the one that fetches the module
+when given nothing — **never resolves under Bare**: no error, no rejection, so a
+ceremony waits forever on a wallet that merely looks slow. `WebAssembly.
+instantiate` works there; the combination with this module's imports does not.
 
-**The crate and the package are one unit.** The TypeScript package's `wasm/`
-directory is *generated* from the Rust crate. A change to the crate is a change
-to the package whether or not the diff shows it. They are versioned, reviewed
-and released together.
+The defect lives in generated glue, so a routine `wasm-pack` rebuild can
+reintroduce it without any crate change. Keep a test that loads the module on
+the runtime you ship to, or the failure surfaces in the field rather than in CI.
 
-## Still to port
+## What lives elsewhere
 
-Everything below still lives in the private monorepo as TypeScript. Listed so
-the remaining surface is visible, not as a claim that it exists here.
+Not a roadmap — a boundary. These exist as TypeScript and are staying that way,
+because none of them touch a share.
 
-| Area | What it covers |
+| Area | Home |
 |---|---|
-| BIP-352 silent payments | address encode/decode, output derivation, scanning against tweak data |
-| MuSig2 transaction tree | Ark cosigning: nonces, partials, branch validation |
-| DLEQ | proving a threshold ECDH share came from the committed secret |
-| Transaction & taproot | sighashes, key-path assembly, script helpers |
-| Ark structures | VTXO outputs, checkpoints, batch expiry |
+| BIP-352 silent payments, taproot construction, transaction serialisation | `chain` |
+| DLEQ **verification**, Lagrange combination of ECDH partials | `chain` |
+| MuSig2 transaction tree, VTXO structures, unilateral exit packages | `vtxo` (frozen) |
 
-Most of it is pure TypeScript over `@noble` and `@scure` with no browser
-dependency, so it may not need to become Rust at all — only FROST did, and only
-because the implementation it delegates to is a Rust crate.
+One boundary case, recorded because it will come up. Silent-payment *sending*
+from a threshold key needs `a_sum · B_scan`, and `a_sum` never exists — so it
+needs an ECDH partial per signer, with a DLEQ proof that the partial came from
+that signer's committed share. **Producing** the partial and its proof touches a
+share, so it belongs here. Everything downstream — combining, verifying,
+deriving the output — is public-data arithmetic and does not.
+
+Do not export the raw signing share to let a caller do that multiplication
+outside. That trades the entire boundary for one scalar multiplication.
 
 ## Dependencies
 
-`@noble/curves`, `@noble/hashes`, `@scure/base`, `@scure/btc-signer` — no
-network, no I/O, no framework.
+Five direct crates, exactly one of them cryptography. See `Cargo.toml`, which
+explains each. No network, no I/O.
 
 ## Security
 
